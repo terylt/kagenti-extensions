@@ -1,0 +1,127 @@
+# CPEX demo: combined — APL coarse gate + Cedar PDP + PII scanner +
+# audit logger. A realistic production-shape configuration.
+#
+# Authorization layers, in order:
+#
+#   1. APL coarse predicate     — cheap; fast-fails before PDP work
+#        require(role.engineer OR role.hr OR role.security)
+#
+#   2. Cedar PDP                — principal × resource decisions
+#        permit(principal, read, Repo) when {...}
+#
+#   3. validator/pii-scan       — content guardrails
+#        deny on SSN / CC / email matches
+#
+#   4. audit/logger (response)  — structured audit per allowed call
+#
+# Flow:
+#   - on_request runs the gate chain (APL → Cedar → PII).
+#   - on_response runs the audit logger only on calls that made it
+#     past the gate, so the audit record reflects what actually
+#     reached the backend.
+
+mode: proxy-sidecar
+
+session:
+  enabled: true
+  ttl: 30m
+  max_events: 100
+  max_sessions: 100
+
+listener:
+  reverse_proxy_addr: ":8080"
+  forward_proxy_addr: ":8081"
+  reverse_proxy_backend: "http://hr-mcp:9100"
+  session_api_addr: "127.0.0.1:9094"
+
+stats:
+  stats_address: "127.0.0.1:9093"
+
+pipeline:
+  inbound:
+    plugins:
+      - name: jwt-validation
+        config:
+          issuer: "http://localhost:8081/realms/cpex-demo"
+          keycloak_url: "http://keycloak:8080"
+          keycloak_realm: "cpex-demo"
+          audience: "hr-copilot"
+
+      - name: mcp-parser
+
+      - name: cpex
+        config:
+          hooks:
+            on_request:
+              # Hook chain fires in order; first deny short-circuits.
+              # All four sub-plugins below resolve under this single
+              # hook name on the CPEX side.
+              - cmf.tool_pre_invoke
+            on_response:
+              - cmf.tool_post_invoke
+
+          apl:
+            identity:
+              jwt:
+                issuer: "http://localhost:8081/realms/cpex-demo"
+                jwks_url: "http://keycloak:8080/realms/cpex-demo/protocol/openid-connect/certs"
+
+            # APL coarse predicates run before any sub-plugin in the
+            # cmf.tool_pre_invoke pipeline; deny here means the
+            # PDP / scanner work is never paid.
+            policies:
+              tool_pre_invoke:
+                - "require(role.engineer OR role.hr OR role.security)"
+
+            pdp:
+              cedar:
+                policies: |
+                  @id("engineering-internal-repos")
+                  permit(
+                    principal,
+                    action == Action::"read",
+                    resource is Repo
+                  ) when {
+                    principal.roles.contains("engineer") &&
+                    resource.visibility == "internal"
+                  };
+
+                  @id("hr-compensation")
+                  permit(
+                    principal,
+                    action == Action::"read",
+                    resource is CompensationRecord
+                  ) when {
+                    principal.roles.contains("hr")
+                  };
+
+                  @id("security-incident-access")
+                  permit(
+                    principal,
+                    action,
+                    resource
+                  ) when {
+                    principal.roles.contains("security")
+                  };
+
+          pipelines:
+            cmf.tool_pre_invoke:
+              - pdp/cedar-direct
+              - validator/pii-scan
+            cmf.tool_post_invoke:
+              # audit/logger emits one record per call describing the
+              # principal, tool, action, args, and outcome. Sink
+              # defaults to slog (route via your observability stack).
+              - audit/logger
+
+          # Fail-closed in this combined config: CPEX is the
+          # primary gate, and silently allowing traffic when it
+          # errors defeats the purpose.
+          fail_open: false
+
+          # Bound CPEX runtime to 2 worker threads in dense
+          # sidecar deployments. 0 uses the CPU count.
+          worker_threads: 2
+
+  outbound:
+    plugins: []

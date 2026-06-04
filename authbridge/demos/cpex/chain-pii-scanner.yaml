@@ -1,0 +1,63 @@
+# CPEX demo: PII scanner.
+#
+# Scenario: catching personally identifiable information in MCP tool
+# arguments before they reach a downstream service. The validator/pii-scan
+# sub-plugin detects SSN, credit-card, and email patterns; deny is the
+# default action for high-confidence matches.
+#
+# Flow:
+#   1. jwt-validation — identity gate (same as chain-cedar-gate)
+#   2. mcp-parser     — body → pctx.Extensions.MCP
+#   3. cpex           — runs validator/pii-scan on tool-call args
+#
+# Note: with body rewriting on the PR roadmap, redact-and-forward
+# isn't yet wired. Use deny outcomes for hard guardrails today.
+
+mode: proxy-sidecar
+
+session:
+  enabled: true
+  ttl: 30m
+
+listener:
+  reverse_proxy_addr: ":8080"
+  forward_proxy_addr: ":8081"
+  reverse_proxy_backend: "http://hr-mcp:9100"
+  session_api_addr: "127.0.0.1:9094"
+
+stats:
+  stats_address: "127.0.0.1:9093"
+
+pipeline:
+  inbound:
+    plugins:
+      - name: jwt-validation
+        config:
+          issuer: "http://localhost:8081/realms/cpex-demo"
+          keycloak_url: "http://keycloak:8080"
+          keycloak_realm: "cpex-demo"
+          audience: "hr-copilot"
+
+      - name: mcp-parser
+
+      - name: cpex
+        config:
+          hooks:
+            on_request:
+              - cmf.tool_pre_invoke
+
+          apl:
+            identity:
+              jwt:
+                issuer: "http://localhost:8081/realms/cpex-demo"
+                jwks_url: "http://keycloak:8080/realms/cpex-demo/protocol/openid-connect/certs"
+
+          pipelines:
+            cmf.tool_pre_invoke:
+              # validator/pii-scan default config: high-confidence
+              # SSN / credit-card / email patterns trigger deny.
+              # Operators tune sensitivity via the factory's config
+              # block (see CPEX docs).
+              - validator/pii-scan
+  outbound:
+    plugins: []
