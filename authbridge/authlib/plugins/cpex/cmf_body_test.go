@@ -250,7 +250,7 @@ func TestMCPToCMFPart_ToolsCallRequest(t *testing.T) {
 			"arguments": map[string]any{"employee_id": "EMP-1", "include_ssn": true},
 		},
 	}
-	got := mcpToCMFPart(mcp, []byte(`{"raw":"req"}`), nil)
+	got := mcpToCMFPart(mcp, false, []byte(`{"raw":"req"}`), nil)
 	if got.Kind != cmfPartToolCall {
 		t.Fatalf("Kind = %v, want cmfPartToolCall", got.Kind)
 	}
@@ -271,7 +271,7 @@ func TestMCPToCMFPart_PromptsGetRequest(t *testing.T) {
 		RPCID:  "abc",
 		Params: map[string]any{"name": "weather", "arguments": map[string]any{"city": "SF"}},
 	}
-	got := mcpToCMFPart(mcp, nil, nil)
+	got := mcpToCMFPart(mcp, false, nil, nil)
 	if got.Kind != cmfPartPromptRequest {
 		t.Fatalf("Kind = %v, want cmfPartPromptRequest", got.Kind)
 	}
@@ -285,7 +285,7 @@ func TestMCPToCMFPart_ResourcesReadRequest(t *testing.T) {
 		Method: "resources/read",
 		Params: map[string]any{"uri": "file:///secret"},
 	}
-	got := mcpToCMFPart(mcp, nil, nil)
+	got := mcpToCMFPart(mcp, false, nil, nil)
 	if got.Kind != cmfPartResourceRef {
 		t.Fatalf("Kind = %v, want cmfPartResourceRef", got.Kind)
 	}
@@ -297,7 +297,7 @@ func TestMCPToCMFPart_ResourcesReadRequest(t *testing.T) {
 func TestMCPToCMFPart_NonActionFallsBackToText(t *testing.T) {
 	mcp := &pipeline.MCPExtension{Method: "tools/list"}
 	body := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
-	got := mcpToCMFPart(mcp, body, nil)
+	got := mcpToCMFPart(mcp, false, body, nil)
 	if got.Kind != cmfPartText {
 		t.Fatalf("Kind = %v, want cmfPartText", got.Kind)
 	}
@@ -307,7 +307,7 @@ func TestMCPToCMFPart_NonActionFallsBackToText(t *testing.T) {
 }
 
 func TestMCPToCMFPart_NilExtensionFallsBackToText(t *testing.T) {
-	got := mcpToCMFPart(nil, []byte("opaque"), nil)
+	got := mcpToCMFPart(nil, false, []byte("opaque"), nil)
 	if got.Kind != cmfPartText || got.Text != "opaque" {
 		t.Fatalf("nil MCP ext: got %+v, want text 'opaque'", got)
 	}
@@ -316,19 +316,16 @@ func TestMCPToCMFPart_NilExtensionFallsBackToText(t *testing.T) {
 // --- mcpToCMFPart: response phase ---
 
 func TestMCPToCMFPart_ToolsCallResponse(t *testing.T) {
-	// mcp-parser augments the SAME extension across phases: Method/Params
-	// persist from the request; Result is added on the response.
+	// Method/Params persist from the request; the tool result is parsed
+	// from the response body (NOT mcp.Result — cpex runs before mcp-parser
+	// on the response phase, so Result isn't populated yet).
 	mcp := &pipeline.MCPExtension{
 		Method: "tools/call",
 		RPCID:  float64(1),
 		Params: map[string]any{"name": "get_compensation"},
-		Result: map[string]any{
-			"content": []any{
-				map[string]any{"type": "text", "text": `{"salary":125000,"ssn":"123-45-6789"}`},
-			},
-		},
 	}
-	got := mcpToCMFPart(mcp, nil, []byte(`{"jsonrpc":"2.0"}`))
+	respBody := []byte(`{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{\"salary\":125000,\"ssn\":\"123-45-6789\"}"}]}}`)
+	got := mcpToCMFPart(mcp, true, nil, respBody)
 	if got.Kind != cmfPartToolResult {
 		t.Fatalf("Kind = %v, want cmfPartToolResult", got.Kind)
 	}
@@ -345,14 +342,26 @@ func TestMCPToCMFPart_ToolsCallResponse(t *testing.T) {
 }
 
 func TestMCPToCMFPart_NonToolsCallResponseFallsBackToText(t *testing.T) {
-	mcp := &pipeline.MCPExtension{
-		Method: "resources/read",
-		Result: map[string]any{"contents": []any{}},
-	}
+	mcp := &pipeline.MCPExtension{Method: "resources/read"}
 	respBody := []byte(`{"jsonrpc":"2.0","id":1,"result":{"contents":[]}}`)
-	got := mcpToCMFPart(mcp, nil, respBody)
+	got := mcpToCMFPart(mcp, true, nil, respBody)
 	if got.Kind != cmfPartText || got.Text != string(respBody) {
 		t.Fatalf("want text fallback with response body, got %+v", got)
+	}
+}
+
+func TestExtractToolResultFromBody(t *testing.T) {
+	body := []byte(`{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{\"ssn\":\"x\",\"salary\":1}"}]}}`)
+	got := extractToolResultFromBody(body)
+	obj, ok := got.(map[string]any)
+	if !ok || obj["ssn"] != "x" {
+		t.Fatalf("expected inner {ssn:x,...}, got %v", got)
+	}
+	if extractToolResultFromBody(nil) != nil {
+		t.Error("nil body → nil")
+	}
+	if extractToolResultFromBody([]byte("not json")) != nil {
+		t.Error("malformed body → nil")
 	}
 }
 

@@ -2,8 +2,8 @@ github.com/Microsoft/go-winio v0.6.2 h1:F2VQgta7ecxGYO8k3ZZz3RS8fVIXVxONVUPlNERo
 github.com/Microsoft/go-winio v0.6.2/go.mod h1:yd8OoFMLzJbo9gZq8j5qaps8bJ9aShtEA8Ipt1oGCvU=
 github.com/cespare/xxhash/v2 v2.3.0 h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=
 github.com/cespare/xxhash/v2 v2.3.0/go.mod h1:VGX0DQ3Q6kWi7AoAeZDth3/j3BFtOZR5XLFGgcrjCOs=
-github.com/contextforge-org/cpex/go/cpex v0.2.0-ffi.test.5 h1:jtcdrOxHVcT7+J5LKG4BG0HDNf3UH9Rk2QRosE/CeqY=
-github.com/contextforge-org/cpex/go/cpex v0.2.0-ffi.test.5/go.mod h1:SuDkdY76asy9MP/72YKqhc2FBcFZ9t5PKe3CeXSO4/g=
+github.com/contextforge-org/cpex/go/cpex v0.2.0-ffi.test.6 h1:sYp11ilroUmtW4ZV7pZZBMTBB06Ql5yqp6X3miraSW0=
+github.com/contextforge-org/cpex/go/cpex v0.2.0-ffi.test.6/go.mod h1:SuDkdY76asy9MP/72YKqhc2FBcFZ9t5PKe3CeXSO4/g=
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=

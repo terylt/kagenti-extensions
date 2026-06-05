@@ -261,13 +261,14 @@ func applyBodyModFromCMF(pctx *pipeline.Context, msg *rcpex.Message) error {
 // Response side picks the first ToolResult content part; its Content
 // field carries the new payload.
 //
-// Phase is determined by mcpIsResponsePhase (Result/Err set by
-// mcp-parser on the response), NOT pctx.Direction: a reverse-proxy
-// pctx stays Direction=Inbound for both phases, so keying on Direction
-// would misroute every response-phase body mod as a request mod.
+// Phase is determined by the presence of a buffered response body (the
+// reverse proxy sets pctx.ResponseBody before the response pipeline runs),
+// NOT pctx.Direction (a reverse-proxy pctx stays Direction=Inbound for
+// both phases) and NOT mcp.Result (mcp-parser runs AFTER cpex on the
+// response, so Result isn't populated yet when we apply).
 func applyMCPBodyModFromCMF(pctx *pipeline.Context, msg *rcpex.Message) error {
 	method := pctx.Extensions.MCP.Method
-	if !mcpIsResponsePhase(pctx.Extensions.MCP) {
+	if len(pctx.ResponseBody) == 0 {
 		mod := MCPRequestBodyMod{}
 		for _, part := range msg.Content {
 			switch part.ContentType {
@@ -355,14 +356,17 @@ func applyExtensionChanges(pctx *pipeline.Context, ext *rcpex.Extensions) {
 //	                context and would leak through CPEX traces)
 func buildCMF(pctx *pipeline.Context) (rcpex.MessagePayload, *rcpex.Extensions) {
 	// Phase drives both the CMF role and which structured part we emit.
-	// A reverse-proxy pctx keeps Direction=Inbound across phases, so the
-	// MCP Result/Err signal — not Direction — tells request from response.
+	// Response phase is signalled by a buffered response body (the reverse
+	// proxy sets it before the response pipeline runs). We must NOT key off
+	// mcp.Result: response hooks run in reverse pipeline order, so cpex
+	// executes before mcp-parser and Result isn't populated yet.
+	isResponse := len(pctx.ResponseBody) > 0
 	role := "user"
-	if mcpIsResponsePhase(pctx.Extensions.MCP) {
+	if isResponse {
 		role = "assistant"
 	}
 
-	part := mcpToCMFPart(pctx.Extensions.MCP, pctx.Body, pctx.ResponseBody)
+	part := mcpToCMFPart(pctx.Extensions.MCP, isResponse, pctx.Body, pctx.ResponseBody)
 	parts := cmfPartToContentParts(part)
 	payload := rcpex.MessagePayload{Message: rcpex.NewMessage(role, parts...)}
 

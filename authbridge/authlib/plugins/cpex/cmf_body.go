@@ -60,26 +60,25 @@ type cmfPart struct {
 	Text string
 }
 
-// mcpIsResponsePhase reports whether the parsed MCP extension describes a
-// response. mcp-parser augments the same pctx.Extensions.MCP across phases:
-// it sets Result or Err only on OnResponse (a JSON-RPC response carries
-// exactly one), while Method/Params persist from the request. This is the
-// reliable request-vs-response signal for a reverse-proxy pctx, whose
-// Direction stays Inbound for both phases.
-func mcpIsResponsePhase(mcp *pipeline.MCPExtension) bool {
-	return mcp != nil && (mcp.Result != nil || mcp.Err != nil)
-}
-
 // mcpToCMFPart decides the structured CMF content part for an MCP message.
-// requestBody / responseBody supply the opaque text fallback for the
-// respective phase.
-func mcpToCMFPart(mcp *pipeline.MCPExtension, requestBody, responseBody []byte) cmfPart {
+// `isResponse` selects the phase; requestBody / responseBody supply the
+// payload (and the opaque text fallback) for that phase.
+//
+// On the response phase the tool result is parsed from responseBody, NOT
+// from mcp.Result: response hooks run in reverse pipeline order, so the
+// cpex plugin executes BEFORE mcp-parser and mcp.Result isn't populated
+// yet. The tool name still persists in mcp.Params from the request phase.
+func mcpToCMFPart(mcp *pipeline.MCPExtension, isResponse bool, requestBody, responseBody []byte) cmfPart {
 	if mcp == nil {
-		return cmfPart{Kind: cmfPartText, Text: string(requestBody)}
+		body := requestBody
+		if isResponse {
+			body = responseBody
+		}
+		return cmfPart{Kind: cmfPartText, Text: string(body)}
 	}
 	corrID := stringifyRPCID(mcp.RPCID)
 
-	if mcpIsResponsePhase(mcp) {
+	if isResponse {
 		// Response phase. Only tools/call yields a structured result
 		// today; other methods fall back to opaque text.
 		if mcp.Method == "tools/call" {
@@ -87,7 +86,7 @@ func mcpToCMFPart(mcp *pipeline.MCPExtension, requestBody, responseBody []byte) 
 				Kind:          cmfPartToolResult,
 				Name:          mcpParamName(mcp.Params),
 				CorrelationID: corrID,
-				Content:       extractToolResultContent(mcp.Result),
+				Content:       extractToolResultFromBody(responseBody),
 				IsError:       mcp.Err != nil,
 			}
 		}
@@ -141,6 +140,23 @@ func cmfEntity(part cmfPart) (entityType, entityName string) {
 	default:
 		return "", ""
 	}
+}
+
+// extractToolResultFromBody parses a JSON-RPC tools/call response body and
+// returns the inner tool result payload (via extractToolResultContent on
+// the `result` object). Used on the response phase, where the cpex plugin
+// runs before mcp-parser and so must parse the body itself rather than
+// read the not-yet-populated mcp.Result.
+func extractToolResultFromBody(body []byte) any {
+	if len(body) == 0 {
+		return nil
+	}
+	var envelope map[string]any
+	if json.Unmarshal(body, &envelope) != nil {
+		return nil
+	}
+	result, _ := envelope["result"].(map[string]any)
+	return extractToolResultContent(result)
 }
 
 // extractToolResultContent pulls the inner tool payload out of an MCP
