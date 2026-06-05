@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # Copyright 2026
 # SPDX-License-Identifier: Apache-2.0
-# Authors: Teryl Taylor
 #
 # Bob (HR, perm.email_send) tries to send an email whose body
 # carries an SSN-like pattern. APL's coarse `require(perm.email_send)`

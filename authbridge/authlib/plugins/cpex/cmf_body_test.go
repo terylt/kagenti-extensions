@@ -238,3 +238,206 @@ func TestStringifyForTextBlock(t *testing.T) {
 		}
 	}
 }
+
+// --- mcpToCMFPart: request phase ---
+
+func TestMCPToCMFPart_ToolsCallRequest(t *testing.T) {
+	mcp := &pipeline.MCPExtension{
+		Method: "tools/call",
+		RPCID:  float64(7), // JSON numbers decode to float64
+		Params: map[string]any{
+			"name":      "get_compensation",
+			"arguments": map[string]any{"employee_id": "EMP-1", "include_ssn": true},
+		},
+	}
+	got := mcpToCMFPart(mcp, []byte(`{"raw":"req"}`), nil)
+	if got.Kind != cmfPartToolCall {
+		t.Fatalf("Kind = %v, want cmfPartToolCall", got.Kind)
+	}
+	if got.Name != "get_compensation" {
+		t.Errorf("Name = %q, want get_compensation", got.Name)
+	}
+	if got.CorrelationID != "7" {
+		t.Errorf("CorrelationID = %q, want 7", got.CorrelationID)
+	}
+	if got.Arguments["employee_id"] != "EMP-1" {
+		t.Errorf("Arguments lost employee_id: %v", got.Arguments)
+	}
+}
+
+func TestMCPToCMFPart_PromptsGetRequest(t *testing.T) {
+	mcp := &pipeline.MCPExtension{
+		Method: "prompts/get",
+		RPCID:  "abc",
+		Params: map[string]any{"name": "weather", "arguments": map[string]any{"city": "SF"}},
+	}
+	got := mcpToCMFPart(mcp, nil, nil)
+	if got.Kind != cmfPartPromptRequest {
+		t.Fatalf("Kind = %v, want cmfPartPromptRequest", got.Kind)
+	}
+	if got.Name != "weather" || got.Arguments["city"] != "SF" || got.CorrelationID != "abc" {
+		t.Errorf("unexpected part: %+v", got)
+	}
+}
+
+func TestMCPToCMFPart_ResourcesReadRequest(t *testing.T) {
+	mcp := &pipeline.MCPExtension{
+		Method: "resources/read",
+		Params: map[string]any{"uri": "file:///secret"},
+	}
+	got := mcpToCMFPart(mcp, nil, nil)
+	if got.Kind != cmfPartResourceRef {
+		t.Fatalf("Kind = %v, want cmfPartResourceRef", got.Kind)
+	}
+	if got.URI != "file:///secret" {
+		t.Errorf("URI = %q, want file:///secret", got.URI)
+	}
+}
+
+func TestMCPToCMFPart_NonActionFallsBackToText(t *testing.T) {
+	mcp := &pipeline.MCPExtension{Method: "tools/list"}
+	body := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+	got := mcpToCMFPart(mcp, body, nil)
+	if got.Kind != cmfPartText {
+		t.Fatalf("Kind = %v, want cmfPartText", got.Kind)
+	}
+	if got.Text != string(body) {
+		t.Errorf("Text = %q, want raw body", got.Text)
+	}
+}
+
+func TestMCPToCMFPart_NilExtensionFallsBackToText(t *testing.T) {
+	got := mcpToCMFPart(nil, []byte("opaque"), nil)
+	if got.Kind != cmfPartText || got.Text != "opaque" {
+		t.Fatalf("nil MCP ext: got %+v, want text 'opaque'", got)
+	}
+}
+
+// --- mcpToCMFPart: response phase ---
+
+func TestMCPToCMFPart_ToolsCallResponse(t *testing.T) {
+	// mcp-parser augments the SAME extension across phases: Method/Params
+	// persist from the request; Result is added on the response.
+	mcp := &pipeline.MCPExtension{
+		Method: "tools/call",
+		RPCID:  float64(1),
+		Params: map[string]any{"name": "get_compensation"},
+		Result: map[string]any{
+			"content": []any{
+				map[string]any{"type": "text", "text": `{"salary":125000,"ssn":"123-45-6789"}`},
+			},
+		},
+	}
+	got := mcpToCMFPart(mcp, nil, []byte(`{"jsonrpc":"2.0"}`))
+	if got.Kind != cmfPartToolResult {
+		t.Fatalf("Kind = %v, want cmfPartToolResult", got.Kind)
+	}
+	if got.Name != "get_compensation" {
+		t.Errorf("ToolName = %q, want get_compensation (preserved from request params)", got.Name)
+	}
+	inner, ok := got.Content.(map[string]any)
+	if !ok {
+		t.Fatalf("Content not parsed to object: %T %v", got.Content, got.Content)
+	}
+	if inner["ssn"] != "123-45-6789" {
+		t.Errorf("inner result missing ssn: %v", inner)
+	}
+}
+
+func TestMCPToCMFPart_NonToolsCallResponseFallsBackToText(t *testing.T) {
+	mcp := &pipeline.MCPExtension{
+		Method: "resources/read",
+		Result: map[string]any{"contents": []any{}},
+	}
+	respBody := []byte(`{"jsonrpc":"2.0","id":1,"result":{"contents":[]}}`)
+	got := mcpToCMFPart(mcp, nil, respBody)
+	if got.Kind != cmfPartText || got.Text != string(respBody) {
+		t.Fatalf("want text fallback with response body, got %+v", got)
+	}
+}
+
+// --- extractToolResultContent ---
+
+func TestExtractToolResultContent_StructuredContentPreferred(t *testing.T) {
+	result := map[string]any{
+		"structuredContent": map[string]any{"salary": 100},
+		"content":           []any{map[string]any{"type": "text", "text": `{"salary":999}`}},
+	}
+	got := extractToolResultContent(result)
+	obj, ok := got.(map[string]any)
+	if !ok || obj["salary"] != 100 {
+		t.Fatalf("structuredContent should win: %v", got)
+	}
+}
+
+func TestExtractToolResultContent_TextBlockParsedAsJSON(t *testing.T) {
+	result := map[string]any{
+		"content": []any{map[string]any{"type": "text", "text": `{"ssn":"x"}`}},
+	}
+	got := extractToolResultContent(result)
+	obj, ok := got.(map[string]any)
+	if !ok || obj["ssn"] != "x" {
+		t.Fatalf("text block should parse as JSON object: %v", got)
+	}
+}
+
+func TestExtractToolResultContent_NonJSONTextWrapped(t *testing.T) {
+	result := map[string]any{
+		"content": []any{map[string]any{"type": "text", "text": "not json"}},
+	}
+	got := extractToolResultContent(result)
+	obj, ok := got.(map[string]any)
+	if !ok || obj["text"] != "not json" {
+		t.Fatalf("non-JSON text should wrap as {text:...}: %v", got)
+	}
+}
+
+func TestExtractToolResultContent_Nil(t *testing.T) {
+	if got := extractToolResultContent(nil); got != nil {
+		t.Fatalf("nil result → nil content, got %v", got)
+	}
+}
+
+// --- cmfEntity (route-selection coordinates) ---
+
+func TestCMFEntity(t *testing.T) {
+	cases := []struct {
+		name               string
+		part               cmfPart
+		wantType, wantName string
+	}{
+		{"tool_call", cmfPart{Kind: cmfPartToolCall, Name: "get_compensation"}, "tool", "get_compensation"},
+		{"tool_result", cmfPart{Kind: cmfPartToolResult, Name: "get_compensation"}, "tool", "get_compensation"},
+		{"prompt", cmfPart{Kind: cmfPartPromptRequest, Name: "weather"}, "prompt", "weather"},
+		{"resource", cmfPart{Kind: cmfPartResourceRef, URI: "file:///x"}, "resource", "file:///x"},
+		{"text_fallback", cmfPart{Kind: cmfPartText, Text: "x"}, "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			et, en := cmfEntity(tc.part)
+			if et != tc.wantType || en != tc.wantName {
+				t.Errorf("cmfEntity(%s) = (%q,%q), want (%q,%q)", tc.name, et, en, tc.wantType, tc.wantName)
+			}
+		})
+	}
+}
+
+// --- stringifyRPCID ---
+
+func TestStringifyRPCID(t *testing.T) {
+	cases := []struct {
+		in   any
+		want string
+	}{
+		{nil, ""},
+		{"req-9", "req-9"},
+		{float64(1), "1"},
+		{float64(1234567), "1234567"},
+		{json.Number("42"), "42"},
+	}
+	for _, tc := range cases {
+		if got := stringifyRPCID(tc.in); got != tc.want {
+			t.Errorf("stringifyRPCID(%v) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}

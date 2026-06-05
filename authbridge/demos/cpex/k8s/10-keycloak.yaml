@@ -52,7 +52,7 @@ spec:
     spec:
       containers:
         - name: keycloak
-          image: quay.io/keycloak/keycloak:26.0
+          image: quay.io/keycloak/keycloak:26.6.3
           args:
             - "start-dev"
             - "--import-realm"
@@ -77,10 +77,17 @@ spec:
               value: "false"
             - name: KC_HEALTH_ENABLED
               value: "true"
-            # Token exchange feature is needed by the demo's
-            # cpex-gateway → workday-api flow (RFC 8693).
-            - name: KC_FEATURES
-              value: "token-exchange,admin-fine-grained-authz"
+            # Standard Token Exchange (V2, RFC 8693) backs the demo's
+            # cpex-gateway → workday-api / github-api delegate() flow. It
+            # is GA + enabled by default from Keycloak 26.2 on (feature
+            # token-exchange-standard:v2) — no KC_FEATURES flag, no
+            # fine-grained admin permissions. Authorization is per-client:
+            # the requester (cpex-gateway) has standard.token.exchange.enabled
+            # in realm-export.json, and the user's subject token carries
+            # cpex-gateway in its `aud` (the cpex-gateway-as-audience mapper).
+            # Do NOT enable the legacy `token-exchange` (V1) preview feature
+            # here — it routes the request down the deprecated FGAP path and
+            # the exchange is rejected with "Client not allowed to exchange".
           ports:
             - name: http
               containerPort: 8080

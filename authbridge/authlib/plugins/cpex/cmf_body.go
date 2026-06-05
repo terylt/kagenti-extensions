@@ -3,9 +3,235 @@ package cpex
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/pipeline"
 )
+
+// cmfPartKind enumerates the structured CMF content part buildCMF emits
+// for a given MCP message. Kept protocol-neutral (no rcpex import) so the
+// MCP→CMF decision is unit-testable without cgo/FFI; the cgo adapter
+// (manager_cpex.go) converts a cmfPart into the matching rcpex ContentPart.
+type cmfPartKind int
+
+const (
+	// cmfPartText is the opaque text fallback. Used for protocol
+	// mechanics (tools/list, initialize, …) and when no MCP extension
+	// was parsed — CPEX gets the raw body as a single text part, no
+	// per-tool route matches, and the request flows unchanged. This
+	// preserves pre-structured-mapping behavior for non-action traffic.
+	cmfPartText cmfPartKind = iota
+	cmfPartToolCall
+	cmfPartPromptRequest
+	cmfPartResourceRef
+	cmfPartToolResult
+)
+
+// cmfPart is a protocol-neutral description of one CMF content part. The
+// cgo adapter maps it onto an rcpex constructor (NewToolCallPart, …). Only
+// the fields relevant to Kind are populated.
+type cmfPart struct {
+	Kind cmfPartKind
+
+	// Name is the tool/prompt name. It is the routing key CPEX matches
+	// against per-tool routes (`- tool: get_compensation`), so it MUST be
+	// set for ToolCall / PromptRequest / ToolResult parts.
+	Name string
+
+	// Arguments is the tool_call / prompt_request argument object that
+	// APL `args.*` predicates (and Cedar `${args.*}`) evaluate against.
+	Arguments map[string]any
+
+	// URI is the resources/read target (ResourceRef parts).
+	URI string
+
+	// CorrelationID threads the JSON-RPC request id through as the
+	// part's *_id field so request and response parts correlate.
+	CorrelationID string
+
+	// Content is the tool_result payload (ToolResult parts) — the parsed
+	// inner object, not the MCP result envelope.
+	Content any
+
+	// IsError flags a tool_result built from a JSON-RPC error response.
+	IsError bool
+
+	// Text is the opaque-fallback body (cmfPartText only).
+	Text string
+}
+
+// mcpIsResponsePhase reports whether the parsed MCP extension describes a
+// response. mcp-parser augments the same pctx.Extensions.MCP across phases:
+// it sets Result or Err only on OnResponse (a JSON-RPC response carries
+// exactly one), while Method/Params persist from the request. This is the
+// reliable request-vs-response signal for a reverse-proxy pctx, whose
+// Direction stays Inbound for both phases.
+func mcpIsResponsePhase(mcp *pipeline.MCPExtension) bool {
+	return mcp != nil && (mcp.Result != nil || mcp.Err != nil)
+}
+
+// mcpToCMFPart decides the structured CMF content part for an MCP message.
+// requestBody / responseBody supply the opaque text fallback for the
+// respective phase.
+func mcpToCMFPart(mcp *pipeline.MCPExtension, requestBody, responseBody []byte) cmfPart {
+	if mcp == nil {
+		return cmfPart{Kind: cmfPartText, Text: string(requestBody)}
+	}
+	corrID := stringifyRPCID(mcp.RPCID)
+
+	if mcpIsResponsePhase(mcp) {
+		// Response phase. Only tools/call yields a structured result
+		// today; other methods fall back to opaque text.
+		if mcp.Method == "tools/call" {
+			return cmfPart{
+				Kind:          cmfPartToolResult,
+				Name:          mcpParamName(mcp.Params),
+				CorrelationID: corrID,
+				Content:       extractToolResultContent(mcp.Result),
+				IsError:       mcp.Err != nil,
+			}
+		}
+		return cmfPart{Kind: cmfPartText, Text: string(responseBody)}
+	}
+
+	// Request phase.
+	switch mcp.Method {
+	case "tools/call":
+		return cmfPart{
+			Kind:          cmfPartToolCall,
+			Name:          mcpParamName(mcp.Params),
+			Arguments:     mcpParamArgs(mcp.Params),
+			CorrelationID: corrID,
+		}
+	case "prompts/get":
+		return cmfPart{
+			Kind:          cmfPartPromptRequest,
+			Name:          mcpParamName(mcp.Params),
+			Arguments:     mcpParamArgs(mcp.Params),
+			CorrelationID: corrID,
+		}
+	case "resources/read":
+		return cmfPart{
+			Kind:          cmfPartResourceRef,
+			URI:           mcpParamURI(mcp.Params),
+			CorrelationID: corrID,
+		}
+	default:
+		// Protocol mechanics (tools/list, initialize, …) — no per-tool
+		// route to match. Pass the raw body through as text.
+		return cmfPart{Kind: cmfPartText, Text: string(requestBody)}
+	}
+}
+
+// cmfEntity maps a cmfPart to the (entity_type, entity_name) pair CPEX's
+// route resolver keys on. cpex-core only dispatches a route's APL policy
+// handlers (require / cedar / delegate / field-redaction) when
+// Extensions.meta carries BOTH entity_type and entity_name (see
+// crates/cpex-core/src/manager.rs filter_entries_by_route); without them
+// the per-tool gates never fire and only always-on global plugins run.
+// caller leaves meta unset so non-action traffic isn't force-routed.
+func cmfEntity(part cmfPart) (entityType, entityName string) {
+	switch part.Kind {
+	case cmfPartToolCall, cmfPartToolResult:
+		return "tool", part.Name
+	case cmfPartPromptRequest:
+		return "prompt", part.Name
+	case cmfPartResourceRef:
+		return "resource", part.URI
+	default:
+		return "", ""
+	}
+}
+
+// extractToolResultContent pulls the inner tool payload out of an MCP
+// tools/call result envelope so APL `result.*` predicates resolve against
+// the real data (e.g. `result.ssn`), not the MCP content wrapper. Prefers
+// the typed structuredContent (MCP 2025-06-18); falls back to parsing the
+// first text block as JSON; on parse-miss wraps the raw text as
+// {"text": <raw>}.
+func extractToolResultContent(result map[string]any) any {
+	if result == nil {
+		return nil
+	}
+	if sc, ok := result["structuredContent"]; ok {
+		return sc
+	}
+	content, ok := result["content"].([]any)
+	if !ok {
+		return nil
+	}
+	for _, b := range content {
+		block, ok := b.(map[string]any)
+		if !ok {
+			continue
+		}
+		if t, _ := block["type"].(string); t != "text" {
+			continue
+		}
+		s, ok := block["text"].(string)
+		if !ok {
+			continue
+		}
+		var inner any
+		if json.Unmarshal([]byte(s), &inner) == nil {
+			return inner
+		}
+		return map[string]any{"text": s}
+	}
+	return nil
+}
+
+// mcpParamName extracts params.name (tool / prompt name) as a string.
+func mcpParamName(params map[string]any) string {
+	if params == nil {
+		return ""
+	}
+	if n, ok := params["name"].(string); ok {
+		return n
+	}
+	return ""
+}
+
+// mcpParamArgs extracts params.arguments as an object, or nil.
+func mcpParamArgs(params map[string]any) map[string]any {
+	if params == nil {
+		return nil
+	}
+	if a, ok := params["arguments"].(map[string]any); ok {
+		return a
+	}
+	return nil
+}
+
+// mcpParamURI extracts params.uri (resources/read target) as a string.
+func mcpParamURI(params map[string]any) string {
+	if params == nil {
+		return ""
+	}
+	if u, ok := params["uri"].(string); ok {
+		return u
+	}
+	return ""
+}
+
+// stringifyRPCID renders a JSON-RPC id (string | number | null) as the
+// stable string CPEX uses for the part's correlation id. JSON numbers
+// decode to float64; format them without a spurious decimal so id 1 stays
+// "1", not "1.000000" or "1e+00".
+func stringifyRPCID(id any) string {
+	switch v := id.(type) {
+	case nil:
+		return ""
+	case string:
+		return v
+	case float64:
+		return strconv.FormatFloat(v, 'f', -1, 64)
+	case json.Number:
+		return v.String()
+	default:
+		return fmt.Sprintf("%v", v)
+	}
+}
 
 // MCPRequestBodyMod describes what changes to apply to an MCP JSON-RPC
 // request body. The cgo adapter extracts these values from a CPEX-
@@ -31,9 +257,6 @@ type MCPRequestBodyMod struct {
 // error) when the original body didn't match the expected shape
 // (e.g., parsed JSON has no `params` object, method is unsupported,
 // or the mod struct's relevant field is empty for the method).
-//
-// Mirrors praxis-cpex's reserialize_json_rpc_body so AuthBridge and
-// praxis stay schema-compatible on the same CPEX policy YAML.
 func applyMCPRequestBodyMod(pctx *pipeline.Context, method string, mod MCPRequestBodyMod) (mutated bool, err error) {
 	if len(pctx.Body) == 0 {
 		return false, nil
@@ -82,11 +305,6 @@ func applyMCPRequestBodyMod(pctx *pipeline.Context, method string, mod MCPReques
 // Returns mutated=true when SetResponseBody was called; mutated=false
 // when the body wasn't a tools/call response, had no result.content,
 // or the response had no replaceable text block.
-//
-// Mirrors praxis-cpex's reserialize_json_rpc_response_body. Both
-// gateways serialize newContent the same way so cross-gateway
-// comparisons of identical policies produce identical bytes on the
-// wire.
 func applyMCPResponseBodyMod(pctx *pipeline.Context, method string, newContent any) (mutated bool, err error) {
 	if method != "tools/call" {
 		return false, nil

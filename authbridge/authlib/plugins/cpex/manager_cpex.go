@@ -79,7 +79,29 @@ func (c *cpexManager) HasHook(name string) bool {
 //     default slog handler with the request ID for correlation.
 func (c *cpexManager) Invoke(_ context.Context, hookName string, pctx *pipeline.Context) (Result, error) {
 	payload, ext := buildCMF(pctx)
-	pres, ct, bg, err := c.mgr.InvokeByName(hookName, rcpex.PayloadCMFMessage, payload, ext, nil)
+
+	// Fused identity-resolve + hook invoke. cpex-core runs the identity
+	// resolvers (jwt-user / jwt-client) ONLY on the identity.resolve hook,
+	// never inside a tool/prompt/resource hook. An FFI host must therefore
+	// resolve identity and forward the principal, or per-route APL gates
+	// (require(role.hr), Cedar principal.roles, redact(!perm.*)) see an
+	// empty subject and deny everything. We use the fused InvokeResolved
+	// rather than a separate resolve+invoke pair so the resolved
+	// raw_credentials — whose inbound tokens are skip-serialized and can't
+	// cross the FFI boundary — reach delegate() in Rust memory for token
+	// exchange.
+	var (
+		pres *rcpex.PipelineResult
+		ct   *rcpex.ContextTable
+		bg   *rcpex.BackgroundTasks
+		err  error
+	)
+	if hookName != rcpex.HookIdentityResolve && c.mgr.HasHooksFor(rcpex.HookIdentityResolve) {
+		idp := rcpex.NewIdentityPayload(rcpex.TokenSourceBearer, lowerHeaders(pctx.Headers))
+		pres, ct, bg, err = c.mgr.InvokeResolved(idp, hookName, rcpex.PayloadCMFMessage, payload, ext, nil)
+	} else {
+		pres, ct, bg, err = c.mgr.InvokeByName(hookName, rcpex.PayloadCMFMessage, payload, ext, nil)
+	}
 	if ct != nil {
 		defer ct.Close()
 	}
@@ -112,6 +134,30 @@ func (c *cpexManager) Invoke(_ context.Context, hookName string, pctx *pipeline.
 	}
 
 	return mapResult(pres), nil
+}
+
+// lowerHeaders flattens http.Header into the lowercase-keyed single-value
+// map the identity resolvers expect (they look their configured header up
+// case-folded). Unlike flattenHeaders this keeps Authorization /
+// X-User-Token — the jwt resolvers need the raw tokens — and does not
+// strip the audit-sensitive set, because the IdentityPayload header map
+// is consumed only by the in-process resolvers, never logged.
+func lowerHeaders(h http.Header) map[string]string {
+	if len(h) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(h))
+	for k, vs := range h {
+		if len(vs) == 0 {
+			continue
+		}
+		if len(vs) == 1 {
+			out[strings.ToLower(k)] = vs[0]
+		} else {
+			out[strings.ToLower(k)] = strings.Join(vs, ", ")
+		}
+	}
+	return out
 }
 
 // awaitBackground blocks on bg.Wait — which returns when every
@@ -206,7 +252,7 @@ func applyBodyModFromCMF(pctx *pipeline.Context, msg *rcpex.Message) error {
 
 // applyMCPBodyModFromCMF translates a CMF Message into the fields
 // applyMCPRequestBodyMod / applyMCPResponseBodyMod expect, then
-// dispatches based on Direction.
+// dispatches based on the request-vs-response phase.
 //
 // Request side picks the first ToolCall / PromptRequest /
 // ResourceReference content part — these are mutually exclusive in
@@ -214,9 +260,14 @@ func applyBodyModFromCMF(pctx *pipeline.Context, msg *rcpex.Message) error {
 //
 // Response side picks the first ToolResult content part; its Content
 // field carries the new payload.
+//
+// Phase is determined by mcpIsResponsePhase (Result/Err set by
+// mcp-parser on the response), NOT pctx.Direction: a reverse-proxy
+// pctx stays Direction=Inbound for both phases, so keying on Direction
+// would misroute every response-phase body mod as a request mod.
 func applyMCPBodyModFromCMF(pctx *pipeline.Context, msg *rcpex.Message) error {
 	method := pctx.Extensions.MCP.Method
-	if pctx.Direction == pipeline.Inbound {
+	if !mcpIsResponsePhase(pctx.Extensions.MCP) {
 		mod := MCPRequestBodyMod{}
 		for _, part := range msg.Content {
 			switch part.ContentType {
@@ -303,17 +354,28 @@ func applyExtensionChanges(pctx *pipeline.Context, ext *rcpex.Extensions) {
 //	                Cookie stripped — they don't belong in policy
 //	                context and would leak through CPEX traces)
 func buildCMF(pctx *pipeline.Context) (rcpex.MessagePayload, *rcpex.Extensions) {
+	// Phase drives both the CMF role and which structured part we emit.
+	// A reverse-proxy pctx keeps Direction=Inbound across phases, so the
+	// MCP Result/Err signal — not Direction — tells request from response.
 	role := "user"
-	if pctx.Direction == pipeline.Outbound {
+	if mcpIsResponsePhase(pctx.Extensions.MCP) {
 		role = "assistant"
 	}
-	var parts []rcpex.ContentPart
-	if len(pctx.Body) > 0 {
-		parts = append(parts, rcpex.NewTextPart(string(pctx.Body)))
-	}
+
+	part := mcpToCMFPart(pctx.Extensions.MCP, pctx.Body, pctx.ResponseBody)
+	parts := cmfPartToContentParts(part)
 	payload := rcpex.MessagePayload{Message: rcpex.NewMessage(role, parts...)}
 
 	ext := &rcpex.Extensions{}
+
+	// Stamp the entity coordinates so cpex-core's route resolver
+	// (filter_entries_by_route) dispatches the per-tool APL policy
+	// handlers — require/Cedar/delegate/field-redaction. Without meta,
+	// only always-on global plugins fire and the route's deny gates are
+	// silently skipped.
+	if et, en := cmfEntity(part); et != "" && en != "" {
+		ext.Meta = &rcpex.MetaExtension{EntityType: et, EntityName: en}
+	}
 
 	if id := pctx.Identity; id != nil {
 		ext.Security = &rcpex.SecurityExtension{
@@ -355,6 +417,50 @@ func buildCMF(pctx *pipeline.Context) (rcpex.MessagePayload, *rcpex.Extensions) 
 	}
 
 	return payload, ext
+}
+
+// cmfPartToContentParts converts the protocol-neutral cmfPart (decided by
+// the tag-free mcpToCMFPart) into the rcpex content part CPEX dispatches
+// on. Splitting the decision (tag-free, unit-tested) from this rcpex
+// conversion (cgo-only) keeps the MCP→CMF mapping testable without the
+// FFI, mirroring the cmf_body.go / applyMCPBodyModFromCMF split.
+//
+// The structured part carries the tool args/result CPEX policies read and
+// rewrite; route *selection* is driven separately by Extensions.Meta (set
+// in buildCMF from cmfEntity).
+func cmfPartToContentParts(part cmfPart) []rcpex.ContentPart {
+	switch part.Kind {
+	case cmfPartToolCall:
+		return []rcpex.ContentPart{rcpex.NewToolCallPart(rcpex.ToolCall{
+			ToolCallID: part.CorrelationID,
+			Name:       part.Name,
+			Arguments:  part.Arguments,
+		})}
+	case cmfPartPromptRequest:
+		return []rcpex.ContentPart{rcpex.NewPromptRequestPart(rcpex.PromptRequest{
+			PromptRequestID: part.CorrelationID,
+			Name:            part.Name,
+			Arguments:       part.Arguments,
+		})}
+	case cmfPartResourceRef:
+		return []rcpex.ContentPart{rcpex.NewResourceRefPart(rcpex.ResourceReference{
+			ResourceRequestID: part.CorrelationID,
+			URI:               part.URI,
+			ResourceType:      "uri",
+		})}
+	case cmfPartToolResult:
+		return []rcpex.ContentPart{rcpex.NewToolResultPart(rcpex.ToolResult{
+			ToolCallID: part.CorrelationID,
+			ToolName:   part.Name,
+			Content:    part.Content,
+			IsError:    part.IsError,
+		})}
+	default: // cmfPartText
+		if part.Text == "" {
+			return nil
+		}
+		return []rcpex.ContentPart{rcpex.NewTextPart(part.Text)}
+	}
 }
 
 // secretHeaderPrefixes lists header-name prefixes that are NEVER
