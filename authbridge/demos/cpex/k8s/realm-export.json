@@ -240,12 +240,12 @@
           }
         },
         {
-          "name": "praxis-gateway-as-audience",
+          "name": "cpex-gateway-as-audience",
           "protocol": "openid-connect",
           "protocolMapper": "oidc-audience-mapper",
           "consentRequired": false,
           "config": {
-            "included.client.audience": "praxis-gateway",
+            "included.client.audience": "cpex-gateway",
             "id.token.claim": "false",
             "access.token.claim": "true"
           }
@@ -253,13 +253,13 @@
       ]
     },
     {
-      "clientId": "praxis-gateway",
-      "name": "Praxis Gateway",
-      "description": "Praxis-CPEX gateway — RFC 8693 token-exchange client.",
+      "clientId": "cpex-gateway",
+      "name": "CPEX Gateway",
+      "description": "CPEX gateway — RFC 8693 token-exchange client.",
       "enabled": true,
       "protocol": "openid-connect",
       "publicClient": false,
-      "secret": "praxis-gateway-secret",
+      "secret": "cpex-gateway-secret",
       "directAccessGrantsEnabled": false,
       "serviceAccountsEnabled": true,
       "standardFlowEnabled": false,

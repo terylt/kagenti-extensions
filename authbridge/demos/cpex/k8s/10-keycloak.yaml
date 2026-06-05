@@ -78,7 +78,7 @@ spec:
             - name: KC_HEALTH_ENABLED
               value: "true"
             # Token exchange feature is needed by the demo's
-            # praxis-gateway → workday-api flow (RFC 8693).
+            # cpex-gateway → workday-api flow (RFC 8693).
             - name: KC_FEATURES
               value: "token-exchange,admin-fine-grained-authz"
           ports:

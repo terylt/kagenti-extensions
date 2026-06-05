@@ -1,11 +1,12 @@
 # hr-mcp backend — FastAPI server speaking MCP-shaped JSON-RPC over
-# HTTP. Same image and code as the cpex-praxis demo's backend
-# (integrations/praxis-cpex/examples/demo/hr-mcp-server/).
+# HTTP. Implements get_compensation, send_email, and search_repos
+# tools used by the demo personas.
 #
 # Image is built locally: `docker build -t hr-mcp:dev .` from the
-# hr-mcp-server dir, then `kind load docker-image hr-mcp:dev --name
-# kagenti`. The imagePullPolicy: Never below tells the kubelet to use
-# the locally-loaded image rather than pull from a registry.
+# hr-mcp-server source dir, then `kind load docker-image hr-mcp:dev
+# --name kagenti`. The imagePullPolicy: Never below tells the
+# kubelet to use the locally-loaded image rather than pull from a
+# registry.
 
 apiVersion: v1
 kind: Service
@@ -48,7 +49,7 @@ spec:
               containerPort: 9100
           # No readiness probe: hr-mcp is a JSON-RPC MCP server with
           # no `/` route, and adding a health endpoint requires
-          # patching the cpex-praxis-integration source. The pod is
+          # patching the upstream hr-mcp-server source. The pod is
           # considered ready once the container starts; sub-second
           # FastAPI startup makes this fine for demo use.
 

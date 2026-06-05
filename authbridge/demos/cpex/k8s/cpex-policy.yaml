@@ -31,11 +31,14 @@ plugins:
       header: X-User-Token
       trusted_issuers:
         - issuer: "http://keycloak.cpex-demo:8080/realms/cpex-demo"
-          audiences: ["praxis-gateway"]
+          audiences: ["cpex-gateway"]
           algorithms: ["RS256"]
           decoding_key:
             kind: jwks_url
             url: "http://keycloak.cpex-demo:8080/realms/cpex-demo/protocol/openid-connect/certs"
+            # Cluster-internal http is intentional — Keycloak runs
+            # in the same namespace and isn't TLS-terminated.
+            insecure_http: true
           leeway_seconds: 60
       claim_mapper: standard
 
@@ -51,11 +54,14 @@ plugins:
       header: Authorization
       trusted_issuers:
         - issuer: "http://keycloak.cpex-demo:8080/realms/cpex-demo"
-          audiences: ["praxis-gateway", "account"]
+          audiences: ["cpex-gateway", "account"]
           algorithms: ["RS256"]
           decoding_key:
             kind: jwks_url
             url: "http://keycloak.cpex-demo:8080/realms/cpex-demo/protocol/openid-connect/certs"
+            # Cluster-internal http is intentional — Keycloak runs
+            # in the same namespace and isn't TLS-terminated.
+            insecure_http: true
           leeway_seconds: 60
       claim_mapper: standard
 
@@ -76,10 +82,13 @@ plugins:
       - write_delegated_tokens
     config:
       token_endpoint: "http://keycloak.cpex-demo:8080/realms/cpex-demo/protocol/openid-connect/token"
-      client_id: "praxis-gateway"
+      # Cluster-internal http to Keycloak — same justification as
+      # the identity plugins' insecure_http.
+      insecure_http: true
+      client_id: "cpex-gateway"
       client_secret_source:
         kind: literal
-        secret: "praxis-gateway-secret"
+        secret: "cpex-gateway-secret"
       timeout_seconds: 5
       default_outbound_header: "Authorization"
 
@@ -146,10 +155,13 @@ plugins:
       - write_delegated_tokens
     config:
       token_endpoint: "http://keycloak.cpex-demo:8080/realms/cpex-demo/protocol/openid-connect/token"
-      client_id: "praxis-gateway"
+      # Cluster-internal http to Keycloak — same justification as
+      # the identity plugins' insecure_http.
+      insecure_http: true
+      client_id: "cpex-gateway"
       client_secret_source:
         kind: literal
-        secret: "praxis-gateway-secret"
+        secret: "cpex-gateway-secret"
       timeout_seconds: 5
       default_outbound_header: "Authorization"
 

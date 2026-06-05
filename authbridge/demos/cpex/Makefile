@@ -12,8 +12,10 @@
 #   - kind cluster (we target `kagenti`; override KIND_CLUSTER)
 #   - docker / podman
 #   - kubectl
-#   - the cpex-praxis-integration repo cloned alongside (for hr-mcp
-#     source + the chat agent + the scenario scripts)
+#   - HR_MCP_SRC pointing at a directory containing the hr-mcp
+#     backend's Dockerfile + server.py + requirements.txt (default
+#     looks for it at ../../../../cpex-mcp-servers/hr-mcp-server;
+#     override on the command line if yours lives elsewhere)
 
 KIND_CLUSTER ?= kagenti
 NAMESPACE    ?= cpex-demo
@@ -24,10 +26,11 @@ AUTHBRIDGE_IMAGE ?= authbridge-cpex:dev
 HR_MCP_IMAGE     ?= hr-mcp:dev
 
 # Source paths for the images. authbridge-cpex builds from the
-# kagenti-extensions tree (this repo); hr-mcp builds from the
-# cpex-praxis-integration repo (sibling clone).
+# kagenti-extensions tree (this repo); hr-mcp is a FastAPI MCP
+# server living in its own repository (override HR_MCP_SRC on the
+# command line if it's not in the default location).
 KAGENTI_ROOT := $(abspath $(CURDIR)/../../..)
-HR_MCP_SRC   := $(KAGENTI_ROOT)/../cpex-praxis-integration/integrations/praxis-cpex/examples/demo/hr-mcp-server
+HR_MCP_SRC   ?= $(KAGENTI_ROOT)/../cpex-mcp-servers/hr-mcp-server
 
 .PHONY: help build-images load-images deploy port-forward scenarios logs undeploy preflight
 
@@ -48,7 +51,7 @@ preflight:  ## Check that prerequisites are in place
 	@command -v kubectl >/dev/null   || { echo "missing: kubectl";    exit 1; }
 	@command -v docker >/dev/null    || { echo "missing: docker";     exit 1; }
 	@kind get clusters | grep -q '^$(KIND_CLUSTER)$$' || { echo "missing kind cluster: $(KIND_CLUSTER)"; exit 1; }
-	@test -d "$(HR_MCP_SRC)" || { echo "missing: $(HR_MCP_SRC) (clone cpex-praxis-integration alongside)"; exit 1; }
+	@test -d "$(HR_MCP_SRC)" || { echo "missing: $(HR_MCP_SRC) (set HR_MCP_SRC=/path/to/hr-mcp-server)"; exit 1; }
 	@echo "preflight OK"
 
 build-images: preflight  ## Build authbridge-cpex + hr-mcp docker images
@@ -100,7 +103,7 @@ port-forward:  ## Forward Keycloak (8081) + gateway (8082) to localhost
 	wait
 
 scenarios:  ## Run all 7 demo curl scenarios (assumes port-forward up)
-	@echo "[NOTE] Scenarios reuse cpex-praxis-integration's scripts pointed at gateway :8082"
+	@echo "[NOTE] Scenarios sourced from $(HR_MCP_SRC)/../scenarios — point at gateway :8082"
 	GATEWAY=http://localhost:8082 \
 	$(HR_MCP_SRC)/../scenarios/01-bob-allow.sh
 	GATEWAY=http://localhost:8082 \
