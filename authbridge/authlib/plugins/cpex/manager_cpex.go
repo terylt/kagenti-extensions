@@ -360,14 +360,23 @@ func buildCMF(pctx *pipeline.Context) (rcpex.MessagePayload, *rcpex.Extensions) 
 // secretHeaderPrefixes lists header-name prefixes that are NEVER
 // forwarded into CPEX. CPEX sub-plugins (notably audit/logger) often
 // log the payload they receive; the session API has no auth on it.
-// So bearer tokens, session cookies, and platform-issued internal
-// secrets must be stripped here, not relied on as opaque-to-CPEX.
+// So session cookies and platform-issued internal secrets must be
+// stripped here, not relied on as opaque-to-CPEX.
 //
-// Mirrors the equivalent list in the colleague's cmf.go and the
-// stripping ibac applies before shipping prompts to the judge LLM —
-// any addition here should be considered for those neighbors too.
+// NOTE on `Authorization`: deliberately NOT stripped. CPEX's
+// identity/jwt plugins (jwt-client, etc.) read the bearer token from
+// the Authorization header to validate signature, audience, expiry,
+// and to extract role/perm/team/group claims that APL predicates
+// (`require(role.hr)`, `redact(!perm.view_ssn)`, …) gate on. Strip
+// it and you lose every gate that depends on the client identity —
+// the request continues to evaluate against an empty client bag,
+// which silently allows traffic the policy meant to deny.
+//
+// The audit-log risk this opens — bearer tokens reaching audit
+// payloads — is mitigated by configuring audit-log to drop
+// Authorization from its output (or by terminating TLS at the
+// sidecar so tokens are short-lived and bound to mTLS).
 var secretHeaderPrefixes = []string{
-	"authorization",
 	"cookie",
 	"set-cookie",
 	"proxy-authorization",

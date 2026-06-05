@@ -12,10 +12,8 @@
 #   - kind cluster (we target `kagenti`; override KIND_CLUSTER)
 #   - docker / podman
 #   - kubectl
-#   - HR_MCP_SRC pointing at a directory containing the hr-mcp
-#     backend's Dockerfile + server.py + requirements.txt (default
-#     looks for it at ../../../../cpex-mcp-servers/hr-mcp-server;
-#     override on the command line if yours lives elsewhere)
+# All source needed for the demo lives in this directory tree
+# (hr-mcp-server/, k8s/, agent/).
 
 KIND_CLUSTER ?= kagenti
 NAMESPACE    ?= cpex-demo
@@ -26,11 +24,10 @@ AUTHBRIDGE_IMAGE ?= authbridge-cpex:dev
 HR_MCP_IMAGE     ?= hr-mcp:dev
 
 # Source paths for the images. authbridge-cpex builds from the
-# kagenti-extensions tree (this repo); hr-mcp is a FastAPI MCP
-# server living in its own repository (override HR_MCP_SRC on the
-# command line if it's not in the default location).
+# kagenti-extensions tree (this repo); hr-mcp is vendored alongside
+# the manifests so the demo is self-contained.
 KAGENTI_ROOT := $(abspath $(CURDIR)/../../..)
-HR_MCP_SRC   ?= $(KAGENTI_ROOT)/../cpex-mcp-servers/hr-mcp-server
+HR_MCP_SRC   ?= $(CURDIR)/hr-mcp-server
 
 .PHONY: help build-images load-images deploy port-forward scenarios logs undeploy preflight
 
@@ -51,7 +48,7 @@ preflight:  ## Check that prerequisites are in place
 	@command -v kubectl >/dev/null   || { echo "missing: kubectl";    exit 1; }
 	@command -v docker >/dev/null    || { echo "missing: docker";     exit 1; }
 	@kind get clusters | grep -q '^$(KIND_CLUSTER)$$' || { echo "missing kind cluster: $(KIND_CLUSTER)"; exit 1; }
-	@test -d "$(HR_MCP_SRC)" || { echo "missing: $(HR_MCP_SRC) (set HR_MCP_SRC=/path/to/hr-mcp-server)"; exit 1; }
+	@test -d "$(HR_MCP_SRC)" || { echo "missing: $(HR_MCP_SRC) (should ship in the demo dir)"; exit 1; }
 	@echo "preflight OK"
 
 build-images: preflight  ## Build authbridge-cpex + hr-mcp docker images
@@ -103,21 +100,11 @@ port-forward:  ## Forward Keycloak (8081) + gateway (8082) to localhost
 	wait
 
 scenarios:  ## Run all 7 demo curl scenarios (assumes port-forward up)
-	@echo "[NOTE] Scenarios sourced from $(HR_MCP_SRC)/../scenarios — point at gateway :8082"
-	GATEWAY=http://localhost:8082 \
-	$(HR_MCP_SRC)/../scenarios/01-bob-allow.sh
-	GATEWAY=http://localhost:8082 \
-	$(HR_MCP_SRC)/../scenarios/02-alice-deny.sh
-	GATEWAY=http://localhost:8082 \
-	$(HR_MCP_SRC)/../scenarios/03-eve-redact.sh
-	GATEWAY=http://localhost:8082 \
-	$(HR_MCP_SRC)/../scenarios/04-alice-internal-allow.sh
-	GATEWAY=http://localhost:8082 \
-	$(HR_MCP_SRC)/../scenarios/05-alice-external-cedar-deny.sh
-	GATEWAY=http://localhost:8082 \
-	$(HR_MCP_SRC)/../scenarios/06-bob-apl-deny.sh
-	GATEWAY=http://localhost:8082 \
-	$(HR_MCP_SRC)/../scenarios/07-bob-pii-deny.sh
+	@for s in $(CURDIR)/scenarios/0[1-7]-*.sh; do \
+	  GATEWAY=http://localhost:8082 \
+	  KEYCLOAK_HOST=http://localhost:8081 \
+	  "$$s"; \
+	done
 
 logs:  ## Tail authbridge-cpex logs
 	kubectl -n $(NAMESPACE) logs -f deploy/authbridge-cpex

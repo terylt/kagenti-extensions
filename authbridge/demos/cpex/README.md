@@ -27,10 +27,9 @@ kagenti or build a kind cluster. You need:
 - **Docker** for building images locally (loaded into kind, not pushed
   to a registry).
 - **kubectl** configured for the `kagenti` cluster context.
-- **An `hr-mcp` backend image** built locally. The Makefile expects
-  the source at `../../../cpex-mcp-servers/hr-mcp-server/` (override
-  with `HR_MCP_SRC=...`); any FastAPI MCP server exposing
-  `get_compensation` and `send_email` tools will work as a drop-in.
+- That's it. The `hr-mcp` backend source, the AuthBridge
+  manifests, and the chat agent are all vendored in this directory
+  tree — no sibling clones needed.
 
 [kagenti]: https://github.com/kagenti/kagenti
 
@@ -189,6 +188,11 @@ chat.py (host)
 | `k8s/30-authbridge-cpex.yaml` | AuthBridge config ConfigMap + Service + Deployment |
 | `k8s/realm-export.json` | Keycloak realm definition (users, clients, mappers) |
 | `k8s/cpex-policy.yaml` | CPEX runtime YAML — APL identity + PDP + delegator + validators + audit |
+| `hr-mcp-server/` | Vendored FastAPI MCP backend (Dockerfile + server.py + requirements.txt). Built into `hr-mcp:dev` by `make build-images`. |
+| `agent/` | Vendored chat agent (chat.py + requirements.txt + walkthrough). |
+| `scenarios/` | Curl-driven test scripts (Bob/Alice/Eve personas exercising allow/deny/redact). Run via `make scenarios`. |
+| `mint-token.sh` | Mints a JWT for a named persona via Keycloak. Used by scenarios + the chat agent. |
+| `verify-token-exchange.sh` | Sanity-checks RFC 8693 token exchange on Keycloak. Run after deploy to confirm the realm import. |
 
 The AuthBridge config (inline in `30-authbridge-cpex.yaml`) is short
 and operator-readable. The CPEX policy YAML (`cpex-policy.yaml`) is
