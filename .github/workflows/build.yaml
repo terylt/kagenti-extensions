@@ -63,6 +63,12 @@ jobs:
             context: ./authbridge
             dockerfile: cmd/authbridge-cpex/Dockerfile
 
+          # SPARC reflection service — the backend the `sparc` plugin calls.
+          # Deployed once per cluster via authbridge/sparc-service/deploy.
+          - name: sparc-service
+            context: ./authbridge/sparc-service
+            dockerfile: Dockerfile
+
     steps:
       # 1. Checkout code
       - name: Checkout repository
