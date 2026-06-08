@@ -95,6 +95,7 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: authbridge-cpex
+        app.kubernetes.io/part-of: cpex-demo
     spec:
       containers:
         - name: authbridge-cpex

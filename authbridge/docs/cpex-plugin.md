@@ -317,4 +317,4 @@ need to route background results separately from foreground logs.
   the binary was built against.
 - [CPEX repository](https://github.com/contextforge-org/cpex) — APL
   DSL, sub-plugin reference, FFI ABI.
-- `demos/cpex/` — runnable demo configurations.
+- `demos/hr-cpex/` — runnable demo configurations.

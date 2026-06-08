@@ -39,6 +39,7 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: hr-mcp
+        app.kubernetes.io/part-of: cpex-demo
     spec:
       containers:
         - name: hr-mcp

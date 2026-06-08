@@ -8,7 +8,7 @@ demonstrate. Read it line-by-line during the demo; the LLM does the rest.
 In one terminal:
 
 ```bash
-# from authbridge/demos/cpex
+# from authbridge/demos/hr-cpex
 make deploy                          # builds images, loads to kind, applies manifests
 ```
 

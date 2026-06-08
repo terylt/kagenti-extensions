@@ -49,6 +49,7 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: keycloak
+        app.kubernetes.io/part-of: cpex-demo
     spec:
       containers:
         - name: keycloak

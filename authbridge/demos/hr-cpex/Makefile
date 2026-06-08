@@ -24,10 +24,11 @@ AUTHBRIDGE_IMAGE ?= authbridge-cpex:dev
 HR_MCP_IMAGE     ?= hr-mcp:dev
 
 # Source paths for the images. authbridge-cpex builds from the
-# kagenti-extensions tree (this repo); hr-mcp is vendored alongside
-# the manifests so the demo is self-contained.
-KAGENTI_ROOT := $(abspath $(CURDIR)/../../..)
-HR_MCP_SRC   ?= $(CURDIR)/hr-mcp-server
+# authbridge module (cmd/ + authlib/, two levels up from this demo
+# dir); hr-mcp is vendored alongside the manifests so the demo is
+# self-contained.
+AUTHBRIDGE_ROOT := $(abspath $(CURDIR)/../..)
+HR_MCP_SRC      ?= $(CURDIR)/hr-mcp-server
 
 .PHONY: help build-images load-images deploy port-forward scenarios logs undeploy preflight
 
@@ -52,8 +53,8 @@ preflight:  ## Check that prerequisites are in place
 	@echo "preflight OK"
 
 build-images: preflight  ## Build authbridge-cpex + hr-mcp docker images
-	@echo "[build] authbridge-cpex from $(KAGENTI_ROOT)"
-	cd $(KAGENTI_ROOT) && docker build \
+	@echo "[build] authbridge-cpex from $(AUTHBRIDGE_ROOT)"
+	cd $(AUTHBRIDGE_ROOT) && docker build \
 		-f cmd/authbridge-cpex/Dockerfile \
 		--build-arg CPEX_FFI_VERSION=$$(cat cmd/authbridge-cpex/CPEX_FFI_VERSION | tr -d '[:space:]') \
 		-t $(AUTHBRIDGE_IMAGE) .
