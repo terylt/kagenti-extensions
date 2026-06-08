@@ -475,6 +475,61 @@ func TestDispatch_InvokeErrorFailOpen(t *testing.T) {
 	}
 }
 
+func TestDispatch_ErrorDecisionFailClosed(t *testing.T) {
+	// A Manager that returns DecisionError WITHOUT a Go error (e.g. an
+	// unappliable body modification mapped to DecisionError, or a future
+	// code path) must fail closed when fail_open=false — never silently
+	// allow. Mirrors the returned-error fail-closed path.
+	fake := &FakeManager{
+		KnownHooks: []string{HookToolPreInvoke},
+		Hooks: map[string]Result{
+			HookToolPreInvoke: {Decision: DecisionError, Reason: "redaction unappliable"},
+		},
+	}
+	cfg := `{"hooks":{"on_request":["cmf.tool_pre_invoke"]},"fail_open":false}`
+	p := setupAndInit(t, fake, cfg)
+	a := p.OnRequest(context.Background(), &pipeline.Context{})
+	if a.Type != pipeline.Reject {
+		t.Fatalf("Type = %d, want Reject (DecisionError fail-closed)", a.Type)
+	}
+	if a.Violation == nil || a.Violation.Code != "cpex.error" {
+		t.Fatalf("want Violation code=cpex.error, got %#v", a.Violation)
+	}
+}
+
+func TestDispatch_ErrorDecisionFailOpen(t *testing.T) {
+	// Same DecisionError, but fail_open=true → Observe + Continue.
+	fake := &FakeManager{
+		KnownHooks: []string{HookToolPreInvoke},
+		Hooks: map[string]Result{
+			HookToolPreInvoke: {Decision: DecisionError, Reason: "redaction unappliable"},
+		},
+	}
+	cfg := `{"hooks":{"on_request":["cmf.tool_pre_invoke"]},"fail_open":true}`
+	p := setupAndInit(t, fake, cfg)
+	a := p.OnRequest(context.Background(), &pipeline.Context{})
+	if a.Type != pipeline.Continue {
+		t.Fatalf("Type = %d, want Continue (DecisionError fail_open=true), got %#v", a.Type, a)
+	}
+}
+
+func TestSanitizeReason(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"", "unspecified"},
+		{"CEDAR.DENIED", "cedar_denied"},
+		{"pii.redacted-field", "pii_redacted_field"},
+		{"café", "caf_"}, // non-ASCII rune → single underscore
+	}
+	for _, tc := range cases {
+		if got := sanitizeReason(tc.in); got != tc.want {
+			t.Errorf("sanitizeReason(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
 func TestDispatch_PathBypassSkipsInvoke(t *testing.T) {
 	fake := &FakeManager{
 		KnownHooks: []string{HookToolPreInvoke},

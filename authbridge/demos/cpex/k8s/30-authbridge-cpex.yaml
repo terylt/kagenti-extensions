@@ -22,9 +22,14 @@ data:
       reverse_proxy_addr: ":8080"
       reverse_proxy_backend: "http://hr-mcp.cpex-demo:9100"
       forward_proxy_addr: ":8081"
-      session_api_addr: "0.0.0.0:9094"
+      # Session API and stats bind to localhost only — both expose raw
+      # user content / internal state and have no auth. Matches the
+      # standalone chain-*.yaml configs. Reach them via
+      # `kubectl port-forward` (works against the pod regardless of
+      # Service ports), never cluster-wide.
+      session_api_addr: "127.0.0.1:9094"
     stats:
-      stats_address: "0.0.0.0:9093"
+      stats_address: "127.0.0.1:9093"
     session:
       enabled: true
       ttl: 30m
@@ -64,15 +69,13 @@ spec:
   selector:
     app.kubernetes.io/name: authbridge-cpex
   ports:
+    # Only the reverse proxy is exposed cluster-wide. Session API (9094)
+    # and stats (9093) bind to localhost in the config above and are
+    # reached via `kubectl port-forward` against the pod, so they are
+    # deliberately NOT listed here.
     - name: reverse-proxy
       port: 8080
       targetPort: 8080
-    - name: session-api
-      port: 9094
-      targetPort: 9094
-    - name: stats
-      port: 9093
-      targetPort: 9093
 
 ---
 apiVersion: apps/v1
@@ -122,8 +125,10 @@ spec:
               mountPath: /etc/cpex
               readOnly: true
           readinessProbe:
+            # /readyz gates on plugin readiness (ANDs Ready() across
+            # plugins); /healthz is always 200 and only fits liveness.
             httpGet:
-              path: /healthz
+              path: /readyz
               port: 9091
             initialDelaySeconds: 5
             periodSeconds: 5

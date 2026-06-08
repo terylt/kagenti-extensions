@@ -50,8 +50,34 @@ func (c *cpexManager) LoadConfig(yaml string) error {
 	return c.mgr.LoadConfig(yaml)
 }
 
-func (c *cpexManager) Initialize(_ context.Context) error {
-	return c.mgr.Initialize()
+// Initialize honors ctx's deadline. The rcpex binding's Initialize is
+// blocking and NOT context-aware (no ctx param; see
+// PluginManager.Initialize), so we run it in a goroutine and select on
+// ctx.Done vs completion. On ctx cancellation we return ctx.Err() so
+// the caller's init budget (main.go's 60s initCtx) is actually
+// enforced.
+//
+// We deliberately do NOT call Shutdown on cancellation: rcpex's
+// Shutdown takes the manager's write lock while Initialize holds the
+// read lock, so Shutdown would block on (not abort) the in-flight
+// cpex_initialize — it can't cancel it. The orphaned goroutine
+// finishes on its own when cpex_initialize returns; its handle is
+// reclaimed by the framework's later Shutdown (or the GC finalizer).
+//
+// TODO: switch to a context-aware Initialize if the rcpex bindings
+// gain one, so a stuck init can be cancelled rather than merely
+// abandoned.
+func (c *cpexManager) Initialize(ctx context.Context) error {
+	done := make(chan error, 1)
+	go func() {
+		done <- c.mgr.Initialize()
+	}()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case err := <-done:
+		return err
+	}
 }
 
 func (c *cpexManager) Shutdown(_ context.Context) {
@@ -78,7 +104,14 @@ func (c *cpexManager) HasHook(name string) bool {
 //     awaited in a fire-and-forget goroutine; errors land on the
 //     default slog handler with the request ID for correlation.
 func (c *cpexManager) Invoke(_ context.Context, hookName string, pctx *pipeline.Context) (Result, error) {
-	payload, ext := buildCMF(pctx)
+	// Phase is taken from the framework-set current phase, NOT inferred
+	// from body length: an empty-bodied response (HTTP 204, empty tool
+	// result) must still be treated as the response phase so response
+	// policy fires. CurrentPhase is "" only outside a dispatch (defensive
+	// — Invoke always runs inside OnRequest/OnResponse), which falls
+	// through to the request phase.
+	isResponse := pctx.CurrentPhase() == pipeline.InvocationPhaseResponse
+	payload, ext := buildCMF(pctx, isResponse)
 
 	// Fused identity-resolve + hook invoke. cpex-core runs the identity
 	// resolvers (jwt-user / jwt-client) ONLY on the identity.resolve hook,
@@ -123,13 +156,19 @@ func (c *cpexManager) Invoke(_ context.Context, hookName string, pctx *pipeline.
 	// through. On deny, the modifications are moot — nothing of the
 	// modified request is forwarded — so skip the work.
 	if pres.ContinueProcessing {
-		if applyErr := applyModificationsToPctx(pctx, pres); applyErr != nil {
-			// Modification-decode failure is a CPEX/pctx contract
-			// mismatch, not a policy failure. Log loudly per the
-			// fail-loud design but don't propagate as a policy
-			// error — the underlying invocation outcome stays as-is.
+		if applyErr := applyModificationsToPctx(pctx, pres, isResponse); applyErr != nil {
+			// A modification CPEX requested could not be applied — a
+			// decode failure (CPEX/pctx contract mismatch) or a body
+			// rewrite we have no re-serializer for. Either way the
+			// modified message did NOT make it onto pctx, so forwarding
+			// the original would silently drop the policy's intent
+			// (e.g. a PII redaction). Surface it as DecisionError +
+			// error so runHooks routes through fail_open: block when
+			// fail_open=false, allow-with-log when true.
 			slog.Warn("cpex: failed to apply modifications",
 				"hook", hookName, "error", applyErr)
+			return Result{Decision: DecisionError, Reason: applyErr.Error()},
+				fmt.Errorf("cpex apply modifications %q: %w", hookName, applyErr)
 		}
 	}
 
@@ -160,10 +199,23 @@ func lowerHeaders(h http.Header) map[string]string {
 	return out
 }
 
+// backgroundWaitTimeout bounds how long awaitBackground blocks on a
+// single Invoke's background tasks. A stalled sink (e.g. an audit
+// endpoint that never responds) would otherwise pin one goroutine per
+// request indefinitely; the deadline caps the leak at one goroutine for
+// at most this long. Best-effort — the result only feeds slog — so a
+// generous value avoids dropping work product from merely-slow sinks.
+const backgroundWaitTimeout = 30 * time.Second
+
 // awaitBackground blocks on bg.Wait — which returns when every
 // background sub-plugin spawned by this Invoke has finished — and
 // logs the per-sub-plugin error report (if any) via slog. Operators
 // pipe the slog output to their audit/observability stack.
+//
+// Bounded by backgroundWaitTimeout: bg.Wait runs in an inner goroutine
+// and we select on it vs a timer. On timeout we log a WARN and return,
+// so a stalled sink can't leak goroutines without bound. The inner
+// goroutine still exits whenever bg.Wait eventually returns.
 //
 // Concurrency notes:
 //   - The goroutine outlives the request; it does NOT touch pctx
@@ -177,26 +229,46 @@ func lowerHeaders(h http.Header) map[string]string {
 //     log stream (e.g. a slow audit sink).
 func awaitBackground(hook, reqID string, bg *rcpex.BackgroundTasks) {
 	start := time.Now()
-	errs, err := bg.Wait()
-	elapsed := time.Since(start)
-	if err != nil {
-		slog.Warn("cpex: background tasks wait failed",
-			"hook", hook, "req_id", reqID, "elapsed", elapsed, "error", err)
-		return
+	type waitResult struct {
+		errs []rcpex.PluginError
+		err  error
 	}
-	for _, e := range errs {
-		slog.Warn("cpex: background sub-plugin error",
-			"hook", hook, "req_id", reqID, "elapsed", elapsed,
-			"plugin", e.PluginName, "code", e.Code, "message", e.Message)
+	done := make(chan waitResult, 1)
+	go func() {
+		errs, err := bg.Wait()
+		done <- waitResult{errs: errs, err: err}
+	}()
+
+	timer := time.NewTimer(backgroundWaitTimeout)
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+		slog.Warn("cpex: background tasks wait timed out",
+			"hook", hook, "req_id", reqID,
+			"elapsed", time.Since(start), "timeout", backgroundWaitTimeout)
+		return
+	case res := <-done:
+		elapsed := time.Since(start)
+		if res.err != nil {
+			slog.Warn("cpex: background tasks wait failed",
+				"hook", hook, "req_id", reqID, "elapsed", elapsed, "error", res.err)
+			return
+		}
+		for _, e := range res.errs {
+			slog.Warn("cpex: background sub-plugin error",
+				"hook", hook, "req_id", reqID, "elapsed", elapsed,
+				"plugin", e.PluginName, "code", e.Code, "message", e.Message)
+		}
 	}
 }
 
-// applyModificationsToPctx writes CPEX's modified Extensions back
-// onto pctx. Body modifications (ModifiedPayload) are detected and
-// logged but not yet re-serialized — that wires up in PR 2 when the
-// CMF → JSON-RPC / OpenAI round-trip lands.
+// applyModificationsToPctx writes CPEX's modified Extensions and body
+// back onto pctx. MCP body modifications are re-serialized; inference /
+// A2A body rewriting is not yet implemented and fails closed (see
+// applyBodyModFromCMF).
 //
-// Extension changes applied today (PR 1):
+// Extension changes applied:
 //
 //   - HttpExtension.RequestHeaders → pctx.Headers
 //     Set the headers CPEX listed; preserve any pctx headers CPEX
@@ -204,7 +276,7 @@ func awaitBackground(hook, reqID string, bg *rcpex.BackgroundTasks) {
 //   - SecurityExtension.Labels → pctx.Extensions.Security.Labels
 //     Merge-add (no duplicates). Existing labels stay; new ones
 //     append. Operators reading session events see the union.
-func applyModificationsToPctx(pctx *pipeline.Context, pres *rcpex.PipelineResult) error {
+func applyModificationsToPctx(pctx *pipeline.Context, pres *rcpex.PipelineResult, isResponse bool) error {
 	if len(pres.ModifiedExtensions) > 0 {
 		ext, err := pres.DeserializeExtensions()
 		if err != nil {
@@ -221,7 +293,7 @@ func applyModificationsToPctx(pctx *pipeline.Context, pres *rcpex.PipelineResult
 			return fmt.Errorf("decode modified payload: %w", err)
 		}
 		if payload != nil {
-			if err := applyBodyModFromCMF(pctx, &payload.Message); err != nil {
+			if err := applyBodyModFromCMF(pctx, &payload.Message, isResponse); err != nil {
 				return fmt.Errorf("apply body mod: %w", err)
 			}
 		}
@@ -231,22 +303,29 @@ func applyModificationsToPctx(pctx *pipeline.Context, pres *rcpex.PipelineResult
 }
 
 // applyBodyModFromCMF dispatches the body-rewriting logic per format
-// detected from pctx.Extensions. Direction (Inbound/Outbound) chooses
-// between request and response body. Unknown formats log a WARN and
-// skip — the operator's policy will continue to function, just
-// without the body modification applied.
-func applyBodyModFromCMF(pctx *pipeline.Context, msg *rcpex.Message) error {
+// detected from pctx.Extensions. isResponse chooses between request and
+// response body.
+//
+// Fail-closed contract: CPEX requested a body modification (e.g. a PII
+// redaction). MCP traffic is re-serialized. For inference / A2A traffic
+// there is no re-serialization path yet, so we cannot apply the change.
+// Returning an error rather than silently forwarding the ORIGINAL body
+// makes the caller (Invoke) surface a DecisionError that fail_open
+// governs — an unappliable redaction blocks (fail_open=false) instead of
+// leaking the unredacted body downstream.
+func applyBodyModFromCMF(pctx *pipeline.Context, msg *rcpex.Message, isResponse bool) error {
 	switch {
 	case pctx.Extensions.MCP != nil:
-		return applyMCPBodyModFromCMF(pctx, msg)
+		return applyMCPBodyModFromCMF(pctx, msg, isResponse)
 	default:
-		// Inference / A2A body rewriting deferred — needs format-
-		// specific re-serialization helpers (OpenAI messages, A2A
-		// fragments).
-		slog.Warn("cpex: body modification skipped — no MCP context",
+		// Inference / A2A body rewriting not yet implemented — needs
+		// format-specific re-serialization helpers (OpenAI messages,
+		// A2A fragments). Fail closed: a requested redaction we can't
+		// apply must not be dropped silently.
+		slog.Warn("cpex: body modification requested but unsupported for this format — failing closed",
 			"has_inference", pctx.Extensions.Inference != nil,
 			"has_a2a", pctx.Extensions.A2A != nil)
-		return nil
+		return fmt.Errorf("body modification requested but not supported for non-MCP traffic")
 	}
 }
 
@@ -261,14 +340,14 @@ func applyBodyModFromCMF(pctx *pipeline.Context, msg *rcpex.Message) error {
 // Response side picks the first ToolResult content part; its Content
 // field carries the new payload.
 //
-// Phase is determined by the presence of a buffered response body (the
-// reverse proxy sets pctx.ResponseBody before the response pipeline runs),
-// NOT pctx.Direction (a reverse-proxy pctx stays Direction=Inbound for
-// both phases) and NOT mcp.Result (mcp-parser runs AFTER cpex on the
+// Phase is supplied by the caller from pctx.CurrentPhase(), NOT inferred
+// from body length (an empty-bodied response must still take the response
+// path), NOT pctx.Direction (a reverse-proxy pctx stays Direction=Inbound
+// for both phases), and NOT mcp.Result (mcp-parser runs AFTER cpex on the
 // response, so Result isn't populated yet when we apply).
-func applyMCPBodyModFromCMF(pctx *pipeline.Context, msg *rcpex.Message) error {
+func applyMCPBodyModFromCMF(pctx *pipeline.Context, msg *rcpex.Message, isResponse bool) error {
 	method := pctx.Extensions.MCP.Method
-	if len(pctx.ResponseBody) == 0 {
+	if !isResponse {
 		mod := MCPRequestBodyMod{}
 		for _, part := range msg.Content {
 			switch part.ContentType {
@@ -345,22 +424,18 @@ func applyExtensionChanges(pctx *pipeline.Context, ext *rcpex.Extensions) {
 }
 
 // buildCMF builds a CMF MessagePayload + Extensions from a
-// pipeline.Context. Mapping (PR 1):
+// pipeline.Context. The phase (request vs response) is supplied by the
+// caller from pctx.CurrentPhase() rather than inferred here. Mapping:
 //
-//	role          = "user" inbound, "assistant" outbound
+//	role          = "user" request, "assistant" response
 //	body          → single text content part when len > 0
 //	identity      → SecurityExtension.Subject (id, roles from Scopes())
 //	identity      → AgentExtension.AgentID from ClientID()
 //	headers       → HttpExtension.RequestHeaders (Authorization and
 //	                Cookie stripped — they don't belong in policy
 //	                context and would leak through CPEX traces)
-func buildCMF(pctx *pipeline.Context) (rcpex.MessagePayload, *rcpex.Extensions) {
+func buildCMF(pctx *pipeline.Context, isResponse bool) (rcpex.MessagePayload, *rcpex.Extensions) {
 	// Phase drives both the CMF role and which structured part we emit.
-	// Response phase is signalled by a buffered response body (the reverse
-	// proxy sets it before the response pipeline runs). We must NOT key off
-	// mcp.Result: response hooks run in reverse pipeline order, so cpex
-	// executes before mcp-parser and Result isn't populated yet.
-	isResponse := len(pctx.ResponseBody) > 0
 	role := "user"
 	if isResponse {
 		role = "assistant"
@@ -467,96 +542,9 @@ func cmfPartToContentParts(part cmfPart) []rcpex.ContentPart {
 	}
 }
 
-// secretHeaderPrefixes lists header-name prefixes that are NEVER
-// forwarded into CPEX. CPEX sub-plugins (notably audit/logger) often
-// log the payload they receive; the session API has no auth on it.
-// So session cookies and platform-issued internal secrets must be
-// stripped here, not relied on as opaque-to-CPEX.
-//
-// NOTE on `Authorization`: deliberately NOT stripped. CPEX's
-// identity/jwt plugins (jwt-client, etc.) read the bearer token from
-// the Authorization header to validate signature, audience, expiry,
-// and to extract role/perm/team/group claims that APL predicates
-// (`require(role.hr)`, `redact(!perm.view_ssn)`, …) gate on. Strip
-// it and you lose every gate that depends on the client identity —
-// the request continues to evaluate against an empty client bag,
-// which silently allows traffic the policy meant to deny.
-//
-// The audit-log risk this opens — bearer tokens reaching audit
-// payloads — is mitigated by configuring audit-log to drop
-// Authorization from its output (or by terminating TLS at the
-// sidecar so tokens are short-lived and bound to mTLS).
-var secretHeaderPrefixes = []string{
-	"cookie",
-	"set-cookie",
-	"proxy-authorization",
-	"x-amz-security-token",
-}
-
-// secretHeaderExact lists exact (case-insensitive) header names that
-// must always be stripped. Used for one-off names that don't fit a
-// prefix scheme.
-var secretHeaderExact = map[string]struct{}{
-	"x-api-key":           {},
-	"x-auth-token":        {},
-	"x-authorization":     {},
-	"x-secret-token":      {},
-	"x-session-token":     {},
-	"x-csrf-token":        {},
-	"x-platform-secret":   {},
-	"x-authbridge-secret": {},
-}
-
-// flattenHeaders converts http.Header (multi-value) into the single-value
-// map shape CPEX's HttpExtension.RequestHeaders requires. Multi-value
-// headers are comma-joined per RFC 7230 §3.2.2 — the standard
-// safe-merge for repeatable HTTP headers. (Set-Cookie, which doesn't
-// follow §3.2.2, lands in secretHeaderPrefixes and is stripped before
-// reaching here.)
-//
-// Sensitive headers (Authorization, Cookie, X-Api-Key, …) are
-// dropped via secretHeaderPrefixes / secretHeaderExact, NOT silently
-// truncated.
-func flattenHeaders(h http.Header) map[string]string {
-	if len(h) == 0 {
-		return nil
-	}
-	out := make(map[string]string, len(h))
-	for k, vs := range h {
-		if isSensitive(k) || len(vs) == 0 {
-			continue
-		}
-		// RFC 7230 §3.2.2: repeatable HTTP headers combine with
-		// comma; non-repeatable ones either have a single value
-		// already or were already filtered (Set-Cookie).
-		if len(vs) == 1 {
-			out[k] = vs[0]
-		} else {
-			out[k] = strings.Join(vs, ", ")
-		}
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out
-}
-
-// isSensitive checks both the prefix and exact-name secret tables.
-// Case-insensitive — HTTP header names are case-insensitive on the
-// wire, and any policy that depends on the case of "Authorization"
-// vs "authorization" is already broken.
-func isSensitive(name string) bool {
-	lower := strings.ToLower(name)
-	if _, ok := secretHeaderExact[lower]; ok {
-		return true
-	}
-	for _, prefix := range secretHeaderPrefixes {
-		if strings.HasPrefix(lower, prefix) {
-			return true
-		}
-	}
-	return false
-}
+// (flattenHeaders, isSensitive, and the secretHeader* tables live in
+// the tag-free headers.go so they're testable under the default
+// CGO_ENABLED=0 build.)
 
 // mapResult collapses a CPEX PipelineResult into our aggregate
 // Decision/Result. Order matters: deny first, then modify, then allow
@@ -591,16 +579,16 @@ func mapResult(p *rcpex.PipelineResult) Result {
 	}
 
 	if len(p.ModifiedPayload) > 0 || len(p.ModifiedExtensions) > 0 {
-		// Extension changes (headers, labels) have already been
-		// applied to pctx by applyModificationsToPctx; body changes
-		// (ModifiedPayload) are still PR 2. Report modify either way
-		// so the Invocation reflects that policy touched the message.
+		// Extension changes (headers, labels) and MCP body changes have
+		// already been applied to pctx by applyModificationsToPctx
+		// before mapResult runs. Report modify so the Invocation
+		// reflects that policy touched the message.
 		res.Decision = DecisionModify
 		switch {
 		case len(p.ModifiedPayload) > 0 && len(p.ModifiedExtensions) > 0:
-			res.Reason = "policy modified headers/labels (body rewrite deferred to PR 2)"
+			res.Reason = "policy modified headers/labels and body"
 		case len(p.ModifiedPayload) > 0:
-			res.Reason = "policy requested body modification (PR 2 will apply)"
+			res.Reason = "policy modified body"
 		default:
 			res.Reason = "policy modified headers/labels"
 		}

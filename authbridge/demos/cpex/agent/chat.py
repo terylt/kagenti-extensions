@@ -276,7 +276,7 @@ def keycloak_token(persona: str, keycloak_host: str) -> str:
         timeout=10,
     )
     resp.raise_for_status()
-    return resp.json()["access_token"]
+    return _extract_access_token(resp)
 
 
 def keycloak_client_token(keycloak_host: str) -> str:
@@ -294,7 +294,26 @@ def keycloak_client_token(keycloak_host: str) -> str:
         timeout=10,
     )
     resp.raise_for_status()
-    return resp.json()["access_token"]
+    return _extract_access_token(resp)
+
+
+def _extract_access_token(resp: httpx.Response) -> str:
+    """Pull access_token out of a Keycloak token response.
+
+    Keycloak can return HTTP 200 with an error body (no access_token),
+    which would make resp.json()["access_token"] raise a bare KeyError
+    that hides the real cause. Read the body, use .get(), and raise an
+    httpx.HTTPStatusError carrying the response so the outer handlers
+    surface a useful message."""
+    body = resp.json()
+    token = body.get("access_token")
+    if not token:
+        raise httpx.HTTPStatusError(
+            f"token response missing access_token: {body!r}",
+            request=resp.request,
+            response=resp,
+        )
+    return token
 
 
 # ---------------------------------------------------------------------------
@@ -336,10 +355,12 @@ class GatewayClient:
         }
         resp = httpx.post(self.gateway_url, json=payload, headers=headers, timeout=30)
         # Distinguish gateway-policy denies (4xx with body text) from
-        # downstream tool errors (200 with JSON-RPC error).
+        # downstream tool errors (200 with JSON-RPC error). Only a
+        # JSON-decode miss falls back to raw text; network/timeout/type
+        # errors propagate so they aren't masked as a {"text": ...} body.
         try:
             data = resp.json()
-        except Exception:
+        except (json.JSONDecodeError, ValueError):
             data = {"text": resp.text}
         return resp.status_code, data
 

@@ -375,9 +375,15 @@ func sanitizeReason(s string) string {
 // to the next hook. Deny stops the chain (returns Reject); other
 // outcomes record the Invocation and let the chain proceed.
 //
-// PR 1: DecisionModify records a modify Invocation; header/label
-// mutations are already applied by manager_cpex.go before we see
-// the Result. Body rewriting still PR 2.
+// DecisionModify records a modify Invocation; header/label and MCP body
+// mutations are already applied by manager_cpex.go before we see the
+// Result.
+//
+// DecisionError and any unrecognized decision fail CLOSED unless
+// fail_open is set: a Result the plugin can't interpret must not
+// silently allow traffic the policy may have meant to block. The
+// fail_open routing matches handleInvokeError so an error surfaced as a
+// Result behaves identically to one surfaced as a returned error.
 func (p *CPEX) applyDecision(pctx *pipeline.Context, res Result) (action pipeline.Action, stop bool) {
 	switch res.Decision {
 	case DecisionAllow:
@@ -399,9 +405,34 @@ func (p *CPEX) applyDecision(pctx *pipeline.Context, res Result) (action pipelin
 	case DecisionObserve:
 		pctx.Observe(res.Reason)
 		return pipeline.Action{Type: pipeline.Continue}, false
+	case DecisionError:
+		reason := res.Reason
+		if reason == "" {
+			reason = "cpex returned an error decision"
+		}
+		return p.handleDecisionError(pctx, errors.New(reason)), true
 	}
-	// DecisionError lands here if a future code path returns it
-	// without an error; treat as fail-open observe.
-	pctx.Observe(fmt.Sprintf("cpex: unknown decision %s", res.Decision))
-	return pipeline.Action{Type: pipeline.Continue}, false
+	// Any unrecognized decision is a contract violation between the
+	// Manager and this chassis — fail closed (honoring fail_open)
+	// rather than allowing unconditionally.
+	return p.handleDecisionError(pctx,
+		fmt.Errorf("cpex: unknown decision %s", res.Decision)), true
+}
+
+// handleDecisionError applies the fail_open policy to a DecisionError /
+// unknown-decision Result. Mirrors handleInvokeError (which handles the
+// returned-error path) so the two failure surfaces behave identically:
+// fail_open=true → Observe + Continue; fail_open=false → Deny with code
+// cpex.error.
+func (p *CPEX) handleDecisionError(pctx *pipeline.Context, err error) pipeline.Action {
+	if p.cfg.FailOpen {
+		slog.Warn("cpex: error decision; allowing per fail_open=true", "error", err)
+		pctx.Observe(fmt.Sprintf("cpex error (fail_open): %v", err))
+		return pipeline.Action{Type: pipeline.Continue}
+	}
+	return pctx.DenyAndRecord(
+		fmt.Sprintf("cpex error: %v", err),
+		"cpex.error",
+		err.Error(),
+	)
 }

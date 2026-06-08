@@ -208,6 +208,16 @@ func TestMCPResponseBodyMod_NilContentNoOp(t *testing.T) {
 	}
 }
 
+func TestMCPResponseBodyMod_MalformedJSONError(t *testing.T) {
+	// Mirrors TestMCPRequestBodyMod_MalformedJSONError on the response
+	// side: an unparseable response body is an error, not a silent no-op.
+	pctx := &pipeline.Context{ResponseBody: []byte(`{not json`)}
+	_, err := applyMCPResponseBodyMod(pctx, "tools/call", map[string]any{"x": 1})
+	if err == nil {
+		t.Fatal("expected error on malformed response JSON")
+	}
+}
+
 func TestMCPResponseBodyMod_NoTextBlockNoMutation(t *testing.T) {
 	// Response had only image/audio blocks; no text block to replace
 	// and no structuredContent to update → no rewrite.
@@ -338,6 +348,26 @@ func TestMCPToCMFPart_ToolsCallResponse(t *testing.T) {
 	}
 	if inner["ssn"] != "123-45-6789" {
 		t.Errorf("inner result missing ssn: %v", inner)
+	}
+}
+
+func TestMCPToCMFPart_ToolsCallResponseError(t *testing.T) {
+	// A tools/call response carrying a JSON-RPC error (mcp.Err != nil)
+	// must surface as a ToolResult part with IsError=true so APL
+	// post-invoke policies can branch on tool failure.
+	mcp := &pipeline.MCPExtension{
+		Method: "tools/call",
+		RPCID:  float64(1),
+		Params: map[string]any{"name": "get_compensation"},
+		Err:    &pipeline.MCPError{Code: -32001, Message: "denied"},
+	}
+	respBody := []byte(`{"jsonrpc":"2.0","id":1,"error":{"code":-32001,"message":"denied"}}`)
+	got := mcpToCMFPart(mcp, true, nil, respBody)
+	if got.Kind != cmfPartToolResult {
+		t.Fatalf("Kind = %v, want cmfPartToolResult", got.Kind)
+	}
+	if !got.IsError {
+		t.Errorf("IsError = false, want true for a JSON-RPC error response")
 	}
 }
 
