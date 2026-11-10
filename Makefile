@@ -91,15 +91,19 @@ cortex: ## Build cortex to ./bin/cortex (PROFILE=full|lite|local, default full)
 # does not replace the default build that dev-install installs.
 # CPEX_FFI_DIR=<dir> links that directory's libcpex_ffi.a instead, for a local
 # CPEX build; nothing is downloaded or verified then.
+# CORTEX_CPEX_TAGS=<tags> adds build tags, comma-separated: `cortexaudit`
+# registers the OCSF audit sink, and needs a CPEX_FFI_DIR library that has it.
 CORTEX_CPEX_DIR := $(BIN_DIR)/cortex-cpex
 CPEX_FFI_DIR ?=
+CORTEX_CPEX_TAGS ?=
+comma := ,
 
 cortex-cpex: ## Build cortex with the cpex plugin (cgo) to ./bin/cortex-cpex/cortex
 	@mkdir -p $(CORTEX_CPEX_DIR)
 	@# On macOS, link for the SDK the Go objects are built against, or ld warns
 	@# that every object targets a newer macOS than the binary.
 	@FFI=$(if $(CPEX_FFI_DIR),$(abspath $(CPEX_FFI_DIR)),$$(bash scripts/fetch-cpex-ffi.sh)) && \
-		TAGS="cpex,$$(go -C scripts/profile-tags run . fullcpex)" && \
+		TAGS="cpex,$$(go -C scripts/profile-tags run . fullcpex)$(if $(CORTEX_CPEX_TAGS),$(comma)$(CORTEX_CPEX_TAGS))" && \
 		if [ "$$(uname -s)" = Darwin ]; then \
 			export MACOSX_DEPLOYMENT_TARGET=$${MACOSX_DEPLOYMENT_TARGET:-$$(xcrun --show-sdk-version)}; \
 		fi && \

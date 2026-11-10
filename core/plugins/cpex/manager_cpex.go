@@ -54,6 +54,12 @@ func NewManager(opts ManagerOptions) (Manager, error) {
 		mgr.Shutdown()
 		return nil, fmt.Errorf("cpex enable APL: %w", err)
 	}
+	// Before any LoadConfig: the loader checks every plugin kind against
+	// the registered factories.
+	if err := registerAuditFactories(mgr); err != nil {
+		mgr.Shutdown()
+		return nil, fmt.Errorf("cpex register audit sink: %w", err)
+	}
 	return &cpexManager{mgr: mgr, opts: opts}, nil
 }
 
@@ -913,10 +919,16 @@ func buildCMF(pctx *pipeline.Context, isResponse bool, opts ManagerOptions) (rcp
 		ext.Delegation = d
 	}
 
-	// Request id / trace headers → RequestExtension (best-effort).
-	if r := requestExtFromHeaders(pctx.Headers); r != nil {
-		ext.Request = r
+	// Trace headers → RequestExtension (best-effort). The request id is
+	// always cortex's own (pctx.RequestID), the id its session events carry,
+	// so anything the engine records for this request, an audit record
+	// included, joins the session event it belongs to. A caller's
+	// X-Request-Id is not dropped: it stays in the request headers.
+	ext.Request = requestExtFromHeaders(pctx.Headers)
+	if ext.Request == nil {
+		ext.Request = &rcpex.RequestExtension{}
 	}
+	ext.Request.RequestID = pctx.RequestID()
 
 	if len(pctx.Headers) > 0 {
 		ext.Http = &rcpex.HttpExtension{
@@ -1042,16 +1054,13 @@ func mapDelegation(d *pipeline.DelegationExtension) *rcpex.DelegationExtension {
 	return out
 }
 
-// requestExtFromHeaders extracts request-correlation ids from common
-// tracing headers into a RequestExtension. Best-effort and low-cost:
-// X-Request-Id for the request id, B3 headers or W3C traceparent for the
-// trace/span ids. Returns nil when none are present so an untraced request
-// doesn't carry an empty Request block.
+// requestExtFromHeaders extracts the trace and span ids from B3 headers or
+// a W3C traceparent into a RequestExtension. Best-effort and low-cost.
+// Returns nil when neither is present; buildCMF adds the request id.
 func requestExtFromHeaders(h http.Header) *rcpex.RequestExtension {
 	if len(h) == 0 {
 		return nil
 	}
-	reqID := h.Get("X-Request-Id")
 	traceID := h.Get("X-B3-Traceid")
 	spanID := h.Get("X-B3-Spanid")
 	if traceID == "" {
@@ -1063,10 +1072,10 @@ func requestExtFromHeaders(h http.Header) *rcpex.RequestExtension {
 			}
 		}
 	}
-	if reqID == "" && traceID == "" && spanID == "" {
+	if traceID == "" && spanID == "" {
 		return nil
 	}
-	return &rcpex.RequestExtension{RequestID: reqID, TraceID: traceID, SpanID: spanID}
+	return &rcpex.RequestExtension{TraceID: traceID, SpanID: spanID}
 }
 
 // cmfPartToContentParts converts the protocol-neutral cmfPart (decided by

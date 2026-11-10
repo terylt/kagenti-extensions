@@ -19,6 +19,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/rossoctl/cortex/core/audit"
 	"github.com/rossoctl/cortex/core/cost/ledger"
 	"github.com/rossoctl/cortex/core/cost/usage"
 	"github.com/rossoctl/cortex/core/pipeline"
@@ -60,6 +61,9 @@ type Server struct {
 	// archive serves history the store no longer holds. nil — every deployment but a laptop
 	// with the archive on — leaves every endpoint exactly as it was. See archive.go.
 	archive *archive.Archive
+	// audit serves GET /v1/audit and the stream's audit-record events. nil, the default
+	// everywhere but a laptop with session.audit on, leaves both absent. See audit.go.
+	audit *audit.Store
 	// allowClear lets DELETE /v1/sessions clear; false refuses it. clearRefusals and
 	// lastRefusalLog rate-limit the log of refusals. See clear.go.
 	allowClear     bool
@@ -205,6 +209,7 @@ func New(addr string, store *session.Store, opts ...Option) *Server {
 	mux.HandleFunc("GET /v1/pipeline", s.handlePipeline)
 	mux.HandleFunc("GET /v1/plugins", s.handlePluginCatalog)
 	mux.HandleFunc("GET /v1/usage", s.handleUsage)
+	mux.HandleFunc("GET /v1/audit", s.handleAudit)
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("GET /{$}", s.handleIndex)
 
@@ -252,6 +257,7 @@ const indexBody = `Cortex / AuthBridge Session API
   GET /v1/pipeline        active plugin pipeline
   GET /v1/plugins         catalog of registered plugins
   GET /v1/usage           time-bucketed usage aggregates
+  GET /v1/audit           signed audit records (?session, ?after, ?limit)
   GET /healthz            liveness probe
 
 Unauthenticated: payloads may contain request and response bodies.
@@ -576,6 +582,16 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	// the subscriber was registered, losing them.
 	sub, cancel := s.store.Subscribe()
 	defer cancel()
+	// A nil channel never receives, so without an audit store its case
+	// below is simply never chosen.
+	var auditSub *audit.Subscription
+	var auditRecords <-chan audit.Record
+	if s.audit != nil {
+		var cancelAudit func()
+		auditSub, cancelAudit = s.audit.Subscribe()
+		defer cancelAudit()
+		auditRecords = auditSub.C
+	}
 
 	// Initial comment lets the client know the stream is live before any events.
 	fmt.Fprint(w, ": ok\n\n")
@@ -585,7 +601,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	defer heartbeat.Stop()
 
 	var id uint64
-	var lastDrops uint64
+	var lastDrops, lastAuditDrops uint64
 
 	for {
 		select {
@@ -610,12 +626,36 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprintf(w, "event: session-event\nid: %d\ndata: %s\n\n", id, payload)
 			flusher.Flush()
 
+		case record, ok := <-auditRecords:
+			if !ok {
+				auditRecords = nil
+				continue
+			}
+			if filter != "" && record.SessionID != filter {
+				continue
+			}
+			payload, err := marshalAudit(record)
+			if err != nil {
+				slog.Debug("sessionapi: marshal audit record failed", "error", err)
+				continue
+			}
+			id++
+			fmt.Fprintf(w, "event: audit-record\nid: %d\ndata: %s\n\n", id, payload)
+			flusher.Flush()
+
 		case <-heartbeat.C:
 			// Surface accumulated drops so the operator can notice a slow client.
 			if drops := sub.Drops(); drops > lastDrops {
 				slog.Warn("sessionapi: sse consumer lagged",
 					"drops", drops, "newDrops", drops-lastDrops)
 				lastDrops = drops
+			}
+			if auditSub != nil {
+				if drops := auditSub.Drops(); drops > lastAuditDrops {
+					slog.Warn("sessionapi: sse consumer lagged on audit records",
+						"drops", drops, "newDrops", drops-lastAuditDrops)
+					lastAuditDrops = drops
+				}
 			}
 			fmt.Fprint(w, ": heartbeat\n\n")
 			flusher.Flush()

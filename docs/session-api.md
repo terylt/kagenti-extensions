@@ -20,10 +20,11 @@ tool results.
 | `GET /v1/sessions/{id}/events/{seq}` | `application/json` | One event by its sequence number |
 | `DELETE /v1/sessions` | `application/json` | Clear every session: the store, and the session archive where one runs. The cost ledger is kept |
 | `DELETE /v1/sessions/{id}` | `application/json` | Erase one session: the store's entry and, where the archive runs, its files (see below) |
-| `GET /v1/events` | `text/event-stream` | SSE stream of new events; `?session=<id>` filters to one session. Heartbeat every 30s |
+| `GET /v1/events` | `text/event-stream` | SSE stream of new events; `?session=<id>` filters to one session. Heartbeat every 30s. With the audit store on, `audit-record` events too |
 | `GET /v1/pipeline` | `application/json` | Active pipeline composition, per plugin: name, direction, position, capabilities, runtime `config` |
 | `GET /v1/plugins` | `application/json` | Catalog of every registered plugin, active or not |
 | `GET /v1/usage` | `application/json` | Windowed usage aggregation — the aggregate behind `agentop cost`; parameters and semantics in [`pricing.md`](pricing.md#reading-usage-over-http) |
+| `GET /v1/audit` | `application/json` | Signed audit records from the policy engine's `ocsf-audit` sink (see below). 404 unless `session.audit` is on |
 | `GET /healthz` | text | Liveness probe |
 
 ## `GET /v1/sessions`
@@ -113,6 +114,32 @@ regardless). The cost ledger, usage totals and inference-router pins are
 kept. An agent still using the session brings it back with its next request.
 agentop's `x` drives it, one request per session for an agent-wide erase —
 see [`laptop-service.md`](laptop-service.md) for the user-facing story.
+
+## `GET /v1/audit` — signed audit records
+
+With `session.audit` on, cortex follows the records file the policy engine's
+`ocsf-audit` sink appends to (`~/.cortex/audit/records.ndjson`, through its
+`file` exporter) and serves the newest records, oldest first. `?session=<id>`
+keeps the records naming that cortex session, `?after=<seq>` pages forward from
+the store's own `seq`, `?limit=N` caps the page (default 500, max 5000).
+
+```json
+{"records": [{"seq": 1, "receivedAt": "...", "requestId": "1-a3f09c",
+  "sessionId": "claude-1", "record": { ...the OCSF record... }}], "skipped": 0}
+```
+
+`record` is the record's bytes exactly as written: the response is encoded
+without HTML escaping, so a verifier recomputes its fingerprint and signature
+from what it receives. `requestId` is cortex's own request id, the one its
+session events carry, so a record joins the session event for the same
+request; `sessionId` is empty when cortex did not resolve the session.
+`skipped` counts lines in the file that were not records.
+
+Cortex does not verify records; agentop does, so cortex never vouches for its
+own audit trail. The store keeps the newest 10,000 records; the file is the
+durable trail, and neither is touched by `DELETE /v1/sessions`. On the stream
+each record is an `audit-record` event with the same shape as one entry of
+`records`.
 
 ## Quick examples
 

@@ -481,6 +481,10 @@ type SessionConfig struct {
 	// Archive is the session archive, which persists sessions to disk on a laptop install. Nil
 	// means the binary's default. See SessionArchiveConfig.
 	Archive *SessionArchiveConfig `yaml:"archive,omitempty" json:"archive,omitempty"`
+
+	// Audit follows the policy engine's signed audit records on a laptop install. Nil means
+	// off. See SessionAuditConfig.
+	Audit *SessionAuditConfig `yaml:"audit,omitempty" json:"audit,omitempty"`
 }
 
 // ClientAffinityEnabled reports whether header-less requests are filed by coding agent.
@@ -1044,6 +1048,11 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.Session.Archive != nil {
 		if err := cfg.Session.Archive.Validate(); err != nil {
+			return nil, err
+		}
+	}
+	if cfg.Session.Audit != nil {
+		if err := cfg.Session.Audit.Validate(); err != nil {
 			return nil, err
 		}
 	}

@@ -32,6 +32,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/rossoctl/cortex/core/audit"
 	"github.com/rossoctl/cortex/core/auth"
 	"github.com/rossoctl/cortex/core/bootstrap"
 	"github.com/rossoctl/cortex/core/clientstate"
@@ -516,6 +517,7 @@ func main() {
 			return nil, nil, nil, err
 		}
 		config.WarnEmptyPipelines(c, slog.Default())
+		ensureAuditDir(c, localInstall)
 		// Rates reload with the rest of the config. Swapped BEFORE the pipelines are
 		// built so a plugin's Configure sees the new table, and swapped in place so
 		// the usage aggregator — which holds this same registry from before the
@@ -1043,7 +1045,10 @@ func main() {
 	plugins.WarmCatalog()
 
 	var sessionAPISrv *sessionapi.Server
+	var auditStore *audit.Store
+	stopAudit := func() {}
 	if cfg.Listener.SessionAPIAddr != "" && sessions != nil {
+		auditStore, stopAudit = openAuditStore(cfg, localInstall)
 		sessionAPISrv = sessionapi.New(
 			cfg.Listener.SessionAPIAddr,
 			sessions,
@@ -1059,6 +1064,8 @@ func main() {
 			// machine's alone: a laptop install binds loopback-only, and its one user owns the
 			// history. See sessionapi.clearRefusal.
 			sessionapi.WithClearAllowed(cfg.Listener.BindLoopbackOnly),
+			// nil unless session.audit is on; GET /v1/audit then serves the sink's records.
+			sessionapi.WithAudit(auditStore),
 		)
 		sessionLn := listeners.take("session-api")
 		go func() {
@@ -1164,6 +1171,9 @@ func main() {
 			slog.Warn("plugin store: final save failed; changes since the last save are lost", "error", err)
 		}
 	}
+
+	// After the listeners, so no stream is still reading it.
+	stopAudit()
 
 	if sessions != nil {
 		sessions.Close()
