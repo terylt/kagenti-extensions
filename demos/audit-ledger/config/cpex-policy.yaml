@@ -1,0 +1,95 @@
+# CPEX policy for the audit-ledger demo: the HR copilot of praxis-proxy/demos
+# policy-engine-audit, with the ocsf-audit sink. run.sh renders it into
+# .state/cpex-policy.yaml, filling @STATE@ and @HOME@.
+#
+# Every verdict (allow, deny, redact) becomes a chained, DSSE-signed OCSF
+# record appended to $HOME/.cortex/audit/records.ndjson, which cortex serves
+# to agentop and the shipper receipts in the ledger.
+#
+# `# slide:` ... `# end-slide` mark the excerpts demo/policy_slide.py shows in
+# the recording; comments inside them are left out.
+
+engine_settings:
+  dispatch: policy
+  audit_stream_namespace: cortex-demo
+  # Content digests are keyed, so a record proves a redaction happened
+  # without letting anyone holding it test guesses at the SSN.
+  capture_content_provenance: true
+  content_provenance_key: provenance_key
+
+secrets:
+  providers:
+    local: { kind: file, base_dir: "@STATE@/secrets" }
+  values:
+    provenance_key: { provider: local, ref: provenance.key }
+
+plugins:
+  # Users' tokens, minted by run.sh and verified against its public key.
+  - name: jwt-user
+    kind: identity/jwt
+    hooks: [identity.resolve]
+    on_error: fail
+    config:
+      role: user
+      header: X-User-Token
+      trusted_issuers:
+        - issuer: "https://idp.audit-demo.invalid"
+          audiences: ["cortex-audit-demo"]
+          algorithms: ["RS256"]
+          decoding_key:
+            kind: pem_file
+            path: "@STATE@/identity/idp.pub.pem"
+          leeway_seconds: 60
+      claim_mapper: standard
+
+  # The audit sink: no hooks, so it records every verdict.
+  - name: ocsf-audit
+    kind: audit/ocsf
+    mode: audit
+    capabilities: [read_subject, read_roles, read_teams, read_agent, read_labels]
+    config:
+      exporters:
+        - { kind: file, path: "@HOME@/.cortex/audit/records.ndjson", fsync: batch }
+      chain: true
+      signing: dsse
+      signing_key_pem_path: "@STATE@/keys/ocsf-signing.pem"
+      signing_key_id: cortex-audit-demo-1
+      authority_uid: cortex-audit-demo
+
+global:
+  pdp:
+    - kind: cel
+
+routes:
+  # Reading an internal wiki page. Allowed for any authenticated caller.
+  - tool: fetch_doc
+    authentication: [jwt-user]
+    authorization:
+      pre_invocation:
+        - "require(perm.tool_execute)"
+
+  # slide: hr-only
+  - tool: get_compensation
+    authentication: [jwt-user]
+    authorization:
+      pre_invocation:
+        - "require(role.hr)"
+        - "taint(secret, session)"
+  # end-slide
+    # slide: redact
+    result:
+      ssn: "str | redact(!perm.view_ssn)"
+    # end-slide
+
+  # slide: tainted
+  - tool: send_email
+    authentication: [jwt-user]
+    authorization:
+      pre_invocation:
+        - "require(perm.email_send)"
+        - "security.labels contains \"secret\": deny('external email blocked: this session accessed secret data', 'session_tainted_secret')"
+  # end-slide
+        - cel:
+            expr: 'args.to.endsWith("@corp.com")'
+            on_deny:
+              - "deny('email to a non-corporate recipient', 'external_recipient')"

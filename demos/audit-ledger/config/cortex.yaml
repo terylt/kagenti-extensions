@@ -1,0 +1,40 @@
+# Demo cortex config. run.sh renders it into .state/home/.cortex/config.yaml,
+# filling @STATE@ and @HOME@, and starts cortex with HOME=.state/home: a
+# config inside $HOME/.cortex is a local install, which session.audit needs,
+# and the private HOME keeps ~/.cortex untouched.
+mode: proxy-sidecar
+listener:
+  roles: [forward]
+  bind_loopback_only: true
+  forward_proxy_addr: 127.0.0.1:47800
+  session_api_addr: 127.0.0.1:47801
+  health_addr: 127.0.0.1:47803
+stats:
+  address: 127.0.0.1:47802
+session:
+  # The agent names its session in this header; policy taint and the audit
+  # records are keyed by it.
+  id_headers: [X-Claude-Code-Session-Id]
+  client_affinity: false
+  process_attribution: "off"
+  archive:
+    enabled: false
+  # Follow the sink's records file and serve it on GET /v1/audit.
+  audit:
+    enabled: true
+cost_ledger:
+  enabled: false
+pipeline:
+  outbound:
+    plugins:
+      - mcp-parser
+      - name: cpex
+        config:
+          hooks:
+            on_request: [cmf.tool_pre_invoke]
+            on_response: [cmf.tool_post_invoke]
+          config_file: "@STATE@/cpex-policy.yaml"
+          fail_open: false
+          # The cortex session the header named, so taint and the audit
+          # records carry it.
+          session_source: resolved

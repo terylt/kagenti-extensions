@@ -1,0 +1,31 @@
+# The ARE immutable ledger and its PostgreSQL, loopback only. run.sh fetches
+# the ledger checkout the migrations come from and sets the variables.
+name: cortex-audit-ledger
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment: { POSTGRES_USER: ledger, POSTGRES_PASSWORD: ledger, POSTGRES_DB: ledger }
+    ports: ["127.0.0.1:${LEDGER_PG_PORT:?}:5432"]
+    volumes:
+      - ${LEDGER_DIR:?}/migrations/001_init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+      - ${LEDGER_DIR}/migrations/002_correlation_id_text.sql:/docker-entrypoint-initdb.d/02-correlation-id.sql:ro
+      - ${LEDGER_DIR}/demo/postgres-init/03-permissions.sql:/docker-entrypoint-initdb.d/03-permissions.sql:ro
+      - ${LEDGER_DIR}/migrations/003_hash_index.sql:/docker-entrypoint-initdb.d/04-hash-index.sql:ro
+      - ${LEDGER_DIR}/migrations/004_input_hash.sql:/docker-entrypoint-initdb.d/05-input-hash.sql:ro
+      - ${LEDGER_DIR}/migrations/005_writer_signature.sql:/docker-entrypoint-initdb.d/06-writer-signature.sql:ro
+      - ${LEDGER_DIR}/migrations/006_proof_envelope_v3.sql:/docker-entrypoint-initdb.d/07-proof-envelope-v3.sql:ro
+      - ${LEDGER_DIR}/migrations/007_widen_entry_type.sql:/docker-entrypoint-initdb.d/08-widen-entry-type.sql:ro
+      - ${LEDGER_DIR}/migrations/008_widen_columns.sql:/docker-entrypoint-initdb.d/09-widen-columns.sql:ro
+      - ${LEDGER_DIR}/migrations/009_legacy_writer_signature_bytes.sql:/docker-entrypoint-initdb.d/10-legacy-writer-signature.sql:ro
+    healthcheck: { test: ["CMD-SHELL", "pg_isready -U ledger"], interval: 2s, timeout: 5s, retries: 15 }
+  ledger:
+    image: ${LEDGER_IMAGE:?}
+    depends_on: { postgres: { condition: service_healthy } }
+    environment:
+      ARE_LEDGER_DB_CONNECTION_STRING: "host=postgres port=5432 user=ledger_app password=ledger_app dbname=ledger sslmode=disable"
+      ARE_LEDGER_GRPC_PORT: "19092"
+      ARE_LEDGER_HEALTH_PORT: "8080"
+      ARE_LEDGER_METRICS_PORT: "8083"
+    ports:
+      - "127.0.0.1:${LEDGER_GRPC_PORT:?}:19092"
+      - "127.0.0.1:${LEDGER_HEALTH_PORT:?}:8080"
