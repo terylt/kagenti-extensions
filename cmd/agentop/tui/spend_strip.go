@@ -569,4 +569,10 @@ func (m *model) spendStripVisible() bool {
 // Being blind to the pane costs the two picker panes one row they could have
 // used. That is the accepted trade: a picker one row short is invisible, an
 // events table one row long is not.
-func (m *model) spendStripReservesRow() bool { return m.height >= spendStripMinHeight }
+//
+// The audit-file viewer is the exception that reads something other than height,
+// and it cannot go stale: auditFile is set once, at construction, and that viewer
+// has no proxy to ask for spend, so the band would be four em dashes forever.
+func (m *model) spendStripReservesRow() bool {
+	return m.auditFile == nil && m.height >= spendStripMinHeight
+}

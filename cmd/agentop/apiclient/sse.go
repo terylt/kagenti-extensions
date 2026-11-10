@@ -15,13 +15,20 @@ import (
 	"github.com/rossoctl/cortex/core/pipeline"
 )
 
-// StreamEvent is what Stream publishes. One of Event or Status is set per
-// message — never both. The TUI treats Status as UI-only state (banner,
-// footer); Event as authoritative session data.
+// StreamEvent is what Stream publishes. Exactly one of Event, Audit or
+// Status is set per message. The TUI treats Status as UI-only state
+// (banner, footer); Event as authoritative session data; Audit as a signed
+// audit record it has yet to verify.
 type StreamEvent struct {
 	Event  *pipeline.SessionEvent
+	Audit  *AuditRecord
 	Status StreamStatus
 }
+
+// auditRecordEvent is the SSE event name the server gives an audit record.
+// A frame with any other name, or none, is a session event, which is what
+// every frame was before audit records existed.
+const auditRecordEvent = "audit-record"
 
 // StreamStatus is a non-data transition on the stream. Terminal states are
 // signalled by the channel closing; StreamStatus is only for live transitions
@@ -121,8 +128,9 @@ func (c *Client) streamOnce(ctx context.Context, filter string, out chan<- Strea
 
 // parseSSE reads SSE frames line-by-line. A frame is a run of lines ending
 // in a blank line. Lines starting with ':' are comments (our heartbeats).
-// We only care about frames with a `data:` line containing a JSON-encoded
-// SessionEvent; other line types are tolerated but ignored.
+// A frame's `event:` line picks how its `data:` decodes: an audit record
+// for `audit-record`, a SessionEvent otherwise. `id:` and `retry:` are
+// tolerated but ignored.
 func parseSSE(ctx context.Context, r io.Reader, out chan<- StreamEvent) error {
 	scanner := bufio.NewScanner(r)
 	// Some events (e.g. full LLM completion bodies) can be many KB. Raise the
@@ -130,14 +138,30 @@ func parseSSE(ctx context.Context, r io.Reader, out chan<- StreamEvent) error {
 	scanner.Buffer(make([]byte, 0, 16*1024), 4*1024*1024)
 
 	var dataBuf strings.Builder
+	var eventName string
 
 	flush := func() {
-		defer dataBuf.Reset()
+		defer func() {
+			dataBuf.Reset()
+			eventName = ""
+		}()
 		if dataBuf.Len() == 0 {
 			return
 		}
-		var ev pipeline.SessionEvent
 		raw := dataBuf.String()
+		if eventName == auditRecordEvent {
+			var rec AuditRecord
+			if err := json.Unmarshal([]byte(raw), &rec); err != nil {
+				slog.Debug("apiclient: dropping malformed audit-record frame", "err", err)
+				return
+			}
+			select {
+			case out <- StreamEvent{Audit: &rec}:
+			case <-ctx.Done():
+			}
+			return
+		}
+		var ev pipeline.SessionEvent
 		if err := json.Unmarshal([]byte(raw), &ev); err != nil {
 			// Corrupt frame — the TUI doesn't need to distinguish malformed
 			// frames from missed ones, but log at debug level so a
@@ -170,8 +194,10 @@ func parseSSE(ctx context.Context, r io.Reader, out chan<- StreamEvent) error {
 				dataBuf.WriteByte('\n')
 			}
 			dataBuf.WriteString(val)
+		case strings.HasPrefix(line, "event:"):
+			eventName = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
 		default:
-			// `event:` / `id:` / `retry:` — not needed by this client.
+			// `id:` / `retry:` — not needed by this client.
 		}
 		if ctx.Err() != nil {
 			return ctx.Err()

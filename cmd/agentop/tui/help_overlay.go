@@ -209,6 +209,8 @@ var jumpTargets = []jumpTarget{
 		desc: "every plugin the proxy offers, from /v1/plugins"},
 	{key: "A", pane: paneAgents,
 		desc: "what each coding agent has spent today; pick one to scope the views"},
+	{key: "V", pane: paneAudit,
+		desc: "the policy engine's signed audit records, verified here"},
 	{key: "$", pane: paneNone, label: "spend",
 		desc: "a drawer over the spend band: tiers and a breakdown"},
 }
@@ -239,7 +241,7 @@ func jumpsFrom(p paneID) []jumpTarget {
 			default:
 				continue
 			}
-		case "C", "A":
+		case "C", "A", "V":
 			// Both need a connection and nothing else, so both are offered everywhere past
 			// the pickers. Sharing the arm rather than duplicating it: the rule is the same
 			// rule, and two copies would be two places to forget.
@@ -372,6 +374,20 @@ var paneKeys = map[paneID]keyGroup{
 			{"esc / ← / h", "back"},
 		},
 	},
+	paneAudit: {
+		title:   "AUDIT (this pane)",
+		purpose: "signed audit records, each checked here from its bytes and the public key",
+		bindings: []keyBinding{
+			{"↑↓ / jk", "navigate"},
+			{"↵ / → / l", "the record and its checks"},
+			{"s", "this session / all sessions, when opened from a session"},
+			{"i", "hide / show identity checks (a flagged record is always shown)"},
+			{"t", "jump to the next flagged record or gap"},
+			{"m", "jump to the next missing-record gap; ↵ shows what the ledger kept"},
+			{"r / V", "refresh"},
+			{"esc / ← / h", "back"},
+		},
+	},
 	paneAgents: {
 		title: "AGENTS (this pane)",
 		// "coding" is load-bearing and pinned by
@@ -413,7 +429,7 @@ var paneKeys = map[paneID]keyGroup{
 // the overlay is stable across openings (Go map iteration is random).
 var otherPaneOrder = []paneID{
 	paneNamespaces, panePods, paneSessions, paneEvents,
-	paneDetail, paneAgents, paneUsage, panePipeline, panePluginDetail, paneCatalog,
+	paneDetail, paneAgents, paneUsage, panePipeline, panePluginDetail, paneAudit, paneCatalog,
 }
 
 // helpKeyColWidth is the fixed width of the key column so descriptions
@@ -953,4 +969,39 @@ func truncToWidth(s string, n int) string {
 // isCSITerminator reports whether b ends an ANSI CSI escape sequence.
 func isCSITerminator(b byte) bool {
 	return (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z')
+}
+
+// auditFileKeys are the audit-file viewer's bindings: the audit pane's, less the ones that need
+// a session to scope to or a pane to return to. Kept in step with auditFileKey, which lets
+// through exactly these.
+var auditFileKeys = keyGroup{
+	title:   "AUDIT RECORDS",
+	purpose: "signed audit records from the records file, each checked here from its bytes and the public key",
+	bindings: []keyBinding{
+		{"↑↓ / jk", "navigate"},
+		{"↵ / → / l", "the record and its checks"},
+		{"esc / ← / h", "back to the records"},
+		{"i", "hide / show identity checks (a flagged record is always shown)"},
+		{"t", "jump to the next flagged record or gap"},
+		{"m", "jump to the next missing-record gap; ↵ shows what the ledger kept"},
+		{"r / V", "refresh"},
+		{"/", "search the records (enter keeps, esc cancels)"},
+		{"n / N", "next / previous match"},
+		{"?", "this help"},
+		{"q · ctrl+c", "quit"},
+	},
+}
+
+// helpBodyAuditFile is the help body in the audit-file viewer. The full overlay's jump section,
+// drill path and every-pane reference describe panes this viewer cannot reach, so it shows the
+// one pane and the overlay's own scroll keys.
+func helpBodyAuditFile(width int) string {
+	if width < helpMinProseWidth {
+		width = helpMinProseWidth
+	}
+	// The scroll keys without their note, which is about panes this viewer has none of.
+	nav := helpNavKeys
+	nav.notes = nil
+	return renderKeyGroup(auditFileKeys, true, width, 0) + "\n\n" +
+		renderKeyGroup(nav, false, width, 0)
 }

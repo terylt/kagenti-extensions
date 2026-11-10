@@ -907,6 +907,7 @@ func TestSpendDrawerHost_CoversEveryPane(t *testing.T) {
 		panePipeline:     true,
 		panePluginDetail: true,
 		paneCatalog:      true,
+		paneAudit:        true,
 	}
 	for p := paneID(0); p <= lastPaneID; p++ {
 		expect, listed := want[p]

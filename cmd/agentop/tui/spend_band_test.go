@@ -1156,6 +1156,8 @@ func TestSpendBandNeedsScopeMarker_EveryPaneIsClassified(t *testing.T) {
 		paneSessions: true, panePipeline: true, panePluginDetail: true,
 		paneCatalog: true, paneUsage: true, paneAgents: true,
 		paneNamespaces: true, panePods: true,
+		// Like usage, it states its scope in its own title, all sessions or one.
+		paneAudit: true,
 	}
 
 	for p := paneID(0); p <= lastPaneID; p++ {

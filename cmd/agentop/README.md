@@ -1222,6 +1222,51 @@ agentop is for, and the other three are surfaces you visit and leave.
     ┼ mean   ┬ +1σ   ┴ −1σ   (blank = no measured responses)
   ```
 
+- <a id="audit"></a>**Audit**: the signed audit records the policy engine's `ocsf-audit`
+  sink writes, opened by `V`. Needs a cortex with `session.audit` on, built with the audit
+  sink. agentop checks every record itself, from its bytes and the signing authority's
+  public key; cortex only serves them, so it never vouches for its own trail.
+
+  INTEGRITY compares the record with its fingerprint and signature: `✗ tampered` means its
+  bytes changed after they were hashed, `? no key` that agentop has no public key for its
+  key id. CHAIN is the link to the record before it: `✗ broken` means that record was
+  changed, `⚠ gap` that it is missing. Between records, a red row marks stream positions
+  with no record (lost or deleted), and a muted row marks a new epoch (the engine
+  restarted; the stream starts over at 0, which is not loss).
+
+  RECEIPT holds each record against the ARE ledger that receipts it, when agentop is
+  started with `agentop observe --ledger host:port` (the ledger's gRPC address; agentop
+  reads it directly, never through cortex). `✓ #N` means the ledger holds the record at
+  chain position N with the same fingerprint agentop recomputed; `✗ differs` that the
+  ledger received a different record under that uid, which shows even when cortex's copy
+  was edited and its fingerprint recomputed; `pending` that it is not receipted yet. The
+  title carries the ledger's verdict on its own chain, and `↵` on a record asks the ledger
+  to verify that receipt. Without `--ledger` the column reads `—`.
+
+  Because the ledger stores each record as it received it, agentop can say what changed,
+  not only that something did. A record the ledger disputes reads `Allowed (was Denied)` in
+  VERDICT when the verdict was edited, and `↵` lists every changed field, the ledger's
+  value against the one cortex serves. A gap row says what the ledger kept for the missing
+  position (`ledger: Denied`).
+
+  Public keys are read from `~/.cortex/audit/keys/<key id>.pub.pem` (PEM, P-256), one per
+  key id the records name. Without them fingerprints and links are still checked.
+
+  `agentop audit` opens this pane on its own, over the records file instead of a cortex,
+  for a proxy that runs the same `ocsf-audit` sink without cortex (Praxis, for one). Point
+  the sink's `file` exporter at a path and the viewer at the same one:
+
+  ```console
+  agentop audit --file /var/log/praxis/audit.ndjson --keys ./keys --ledger localhost:50051
+  ```
+
+  `--file` defaults to `~/.cortex/audit/records.ndjson` and `--keys` to
+  `~/.cortex/audit/keys`. The file is followed as the sink appends, and may not exist yet.
+  Unlike cortex, which reads it as a log, the viewer shows the file as it is now: when a
+  record already shown is edited in place, a line is deleted or the file is replaced, it
+  rereads the file and says so, so tampering shows the moment it happens. The checks, rows and keys are this pane's, less `s` (there is
+  no session to scope to) and the keys that open other panes.
+
 - **Catalog**: registered-plugin browser, opened by `P` from any
   session-view pane. Lists every plugin the running binary knows how to
   construct, including ones not in the active pipeline. Useful for
@@ -1363,6 +1408,12 @@ Layered on top of all of them:
 | `Esc` | pipeline | back to the pane `P` was pressed on |
 | `C` | any session-view pane (not the picker) | open the registered-plugin catalog. Was `P` until the pipeline took that letter |
 | `r` | catalog | refresh the catalog from `/v1/plugins` |
+| `V` | any session-view pane (not the picker) | open the audit records, each verified here; see [Audit](#audit). From the events or detail pane it opens on that session; pressed on the audit pane it refreshes |
+| `↵` | audit | the record under the cursor: what each check found, then the record itself. `Esc` returns to the rows |
+| `s` | audit, opened from a session | toggle between that session's records and every record |
+| `t` | audit | jump to the next flagged record or gap: tampered, broken, after a gap, or disputed by the ledger |
+| `i` | audit | hide or show the identity checks each call produces. Display only: gaps are still drawn against the whole stream, and a flagged record (tampered, broken, after a gap, or disputed by the ledger) is always shown |
+| `r` | audit | refetch the records |
 | `A` | any session-view pane (not the picker) | open the per-agent cost breakdown — what each coding agent has spent today (`w` moves the window), plus a row of dashes for any agent that owns a listed session but has spent nothing in it, since the sessions list is not limited to today and every session in it needs a row to scope to. Capital `A` because lowercase `a` cycles the spend drawer's axis. Refetches on every press and opens however many agents it finds, one or none included; pressed on the agents pane it only refreshes the rows. Not in the footer, for width; the `?` overlay names it |
 | `↑↓` / `jk` | agents | move the cursor |
 | `↵` | agents | scope to the agent under the cursor and list its sessions, whichever pane `A` was pressed on — including the agent already scoped, which stays scoped. **The first row, All agents, clears the scope.** It reaches the sessions list, the usage pane, and the spend band and its drawer — except on the agents pane itself, where the band and the drawer follow the highlighted row instead of the committed scope; `agentop cost --agent` is a separate process |

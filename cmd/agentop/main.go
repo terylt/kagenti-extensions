@@ -69,7 +69,7 @@ func displayVersionOf(version, revision string) string {
 // The deprecated "claude-code" alias still dispatches (its case stays in main)
 // but is intentionally omitted here: it is no longer advertised in the usage
 // block or the unknown-subcommand hint. Use "configure claude-code" instead.
-var dispatchableSubcommands = []string{"observe", "setup", "doctor", "uninstall", "service", "configure", "exec", "server", "tools", "pipeline", "pricing", "cost", "experimental"}
+var dispatchableSubcommands = []string{"observe", "audit", "setup", "doctor", "uninstall", "service", "configure", "exec", "server", "tools", "pipeline", "pricing", "cost", "experimental"}
 
 // unknownSubcommandMessage is the error for an unrecognised first argument.
 func unknownSubcommandMessage(name string) string {
@@ -86,6 +86,8 @@ func writeRootUsage(fs *flag.FlagSet) {
 
 Usage:
   agentop observe              open the traffic viewer (TUI)
+  agentop audit                verify and watch a records file of signed audit
+                               records, with no cortex (--help)
   agentop setup                install or repair Cortex on this machine (--help)
   agentop doctor               check this machine's Cortex install (--help)
   agentop uninstall            remove Cortex from this machine (--help)
@@ -157,6 +159,8 @@ func main() {
 			os.Exit(runService(os.Args[2:], os.Stdout, os.Stderr))
 		case "observe":
 			os.Exit(runObserve(os.Args[2:]))
+		case "audit":
+			os.Exit(runAudit(os.Args[2:], os.Stdout, os.Stderr))
 		case "setup":
 			os.Exit(runSetup(os.Args[2:], os.Stdout, os.Stderr))
 		case "doctor":
@@ -400,6 +404,8 @@ type observeFlags struct {
 	kubernetes *bool
 	// skipClaudeMetadata turns off the implicit harvest. See registerObserveFlags.
 	skipClaudeMetadata *bool
+	// ledger is the ARE ledger the audit pane checks receipts against.
+	ledger *string
 }
 
 // registerObserveFlags declares the viewer's flags on fs and returns the pointers.
@@ -448,6 +454,8 @@ func registerObserveFlags(fs *flag.FlagSet) observeFlags {
 		// background tea.Cmd it costs no startup time either way. What is left for this
 		// flag to decline is narrower, and it is the reason to keep it: a machine where
 		// ~/.claude should simply not be touched.
+		ledger: fs.String("ledger", "",
+			"gRPC address (host:port) of the ARE immutable ledger that receipts the policy engine's audit records. The audit pane (V) then checks every record against the ledger's copy and shows its receipt. agentop reads the ledger directly, never through Cortex."),
 		skipClaudeMetadata: fs.Bool("skip-claude-metadata", false,
 			"do not harvest session titles from Claude Code's transcripts. By default agentop observe scans CLAUDE_CONFIG_DIR / ~/.claude in the background once the viewer is up and records titles in ~/.cortex/session-metadata.json, so sessions show a name instead of a bare UUID. This skips the scan; titles already recorded by earlier runs are still shown, and a session the harvest has not named falls back to the title the proxy serves, so a bare id usually means neither source named it — except for a session the proxy has stopped listing, whose served title is not retained and so goes away with the listing."),
 	}
@@ -547,7 +555,7 @@ func runObserve(args []string) int {
 	// address would point [l] at it and take away the in-cluster default, so a
 	// working `kubectl port-forward` on 9094 could not be reached with the one key
 	// that exists for exactly that.
-	opts := tui.RunOptions{Endpoint: *endpoint, Version: displayVersion()}
+	opts := tui.RunOptions{Endpoint: *endpoint, Version: displayVersion(), Ledger: *f.ledger}
 	opts.Harvest = observeHarvester(f, os.Stderr)
 	if prefsPath != "" {
 		opts.Save = func(s tui.UserSettings) error { return saveUserConfig(prefsPath, s) }

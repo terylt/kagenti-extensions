@@ -116,6 +116,22 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		return nil
 	}
 
+	// The audit-file viewer lets through only the keys its one pane uses; see auditFileKey.
+	if m.auditFile != nil {
+		if cmd, handled := m.auditFileKey(msg); handled {
+			return cmd
+		}
+	}
+
+	// The audit pane's own keys, ahead of the global ones that share the letters: `s` here
+	// scopes the records, where globally it hides inactive events, and Enter opens a record.
+	if m.pane == paneAudit && !m.searching {
+		switch msg.String() {
+		case "enter", "right", "l", "r", "s", "i", "t", "m":
+			return m.handleAuditKey(msg)
+		}
+	}
+
 	// The Usage pane owns the keyboard while it is up, except for esc/q which
 	// the shared handling above already routed.
 	if m.pane == paneUsage && !m.searching {
@@ -484,6 +500,23 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 			// Enter arm below. esc means "back out" on every other pane here, and a key that
 			// silently discarded a scope on the way out would be the one exception.
 			return m.leaveAgentsPane()
+		case paneAudit:
+			// A record's detail closes first; then back to the pane `V` was pressed on,
+			// falling back to sessions for the reason the catalog does.
+			if m.audit.detail {
+				m.audit.detail = false
+				return nil
+			}
+			if m.previousPane != paneNone {
+				m.pane = m.previousPane
+				m.previousPane = paneNone
+			} else {
+				m.pane = paneSessions
+			}
+			if m.pane == paneUsage {
+				return m.beginFetch()
+			}
+			return nil
 		case paneCatalog:
 			// Return to whichever pane the user pressed `C` from.
 			//
@@ -881,6 +914,20 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		// reply lands the reader may have navigated elsewhere.
 		return m.fetchAgentRowsCmd(agentsOpenOnPress, m.pane)
 
+	case "V":
+		// Open the audit records, verified here. Available wherever `C` is: it needs a
+		// connection and nothing else. On the pane itself it refetches.
+		if m.client == nil {
+			return nil
+		}
+		switch m.pane {
+		case paneNamespaces, panePods:
+			return nil
+		case paneAudit:
+			return m.refreshAuditCmd()
+		}
+		return m.openAudit()
+
 	case "C":
 		// Open the registered-plugin catalog. Available from any
 		// session-view pane; in --endpoint mode the picker fields
@@ -949,6 +996,8 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		var cmd tea.Cmd
 		m.catalogTbl, cmd = m.catalogTbl.Update(msg)
 		return cmd
+	case paneAudit:
+		return m.handleAuditKey(msg)
 	case paneAgents:
 		// Without this arm the pane's navigation keys fell off the end of the switch and
 		// returned nil, while its footer printed "[↑↓] nav" and the help overlay listed
@@ -970,6 +1019,12 @@ func (m *model) goTop() {
 	switch m.pane {
 	case paneCatalog:
 		setCursorVisible(&m.catalogTbl, 0)
+	case paneAudit:
+		if m.audit.detail {
+			m.audit.vp.GotoTop()
+		} else {
+			setCursorVisible(&m.auditTbl, 0)
+		}
 	case paneSessions:
 		setCursorVisible(&m.sessionsTbl, 0)
 	case paneEvents:
@@ -999,6 +1054,12 @@ func (m *model) goBottom() {
 		setCursorVisible(&m.pipelineTbl, len(m.pipelineTbl.Rows())-1)
 	case paneCatalog:
 		setCursorVisible(&m.catalogTbl, len(m.catalogTbl.Rows())-1)
+	case paneAudit:
+		if m.audit.detail {
+			m.audit.vp.GotoBottom()
+		} else {
+			setCursorVisible(&m.auditTbl, len(m.auditTbl.Rows())-1)
+		}
 	case paneDetail, panePluginDetail:
 		m.detailVp.GotoBottom()
 	}
@@ -1033,6 +1094,13 @@ func (m *model) pageActivePane(msg tea.KeyMsg) tea.Cmd {
 		page(&m.pipelineTbl)
 	case paneCatalog:
 		page(&m.catalogTbl)
+	case paneAudit:
+		if m.audit.detail {
+			var cmd tea.Cmd
+			m.audit.vp, cmd = m.audit.vp.Update(msg)
+			return cmd
+		}
+		page(&m.auditTbl)
 	case paneDetail, panePluginDetail:
 		var cmd tea.Cmd
 		m.detailVp, cmd = m.detailVp.Update(msg)
@@ -1254,6 +1322,8 @@ func (m *model) helpView() string {
 		// bought nothing but a line of footer.
 		return "[m] metric  [w] window" + breakdownHint + scopeHint +
 			"  " + m.searchHints(m.pane) + "  [esc] back  [?] keys  [q] quit"
+	case paneAudit:
+		return m.auditFooter()
 	case paneCatalog:
 		if m.catalog == nil {
 			return "loading catalog…  [esc] back  [?] keys  [q] quit"
@@ -1364,6 +1434,7 @@ func (m *model) layout() {
 	// heights are set.
 	m.pipelineTbl.SetColumns(fitTableColumns(pipelineColumns(), m.width))
 	m.catalogTbl.SetColumns(fitTableColumns(catalogColumns(), m.width))
+	m.auditTbl.SetColumns(fitTableColumns(auditColumns(), m.width))
 	m.rebuildAgentsTable()
 
 	m.sessionsTbl.SetHeight(bodyH)
@@ -1393,6 +1464,8 @@ func (m *model) layout() {
 	// covered this pane but never populated m.catalog, so it only ever measured the
 	// "loading catalog…" line.
 	m.catalogTbl.SetHeight(bodyH)
+	m.auditTbl.SetHeight(bodyH)
+	m.audit.vp.Width, m.audit.vp.Height = m.width, bodyH
 	// The agents table had the catalog's bug, whose comment above is this one's history: nothing
 	// sized it anywhere, so it kept bubbles' table.New default for the life of the process and
 	// rendered past the bottom of any shorter terminal. The catalog's blind spot was an empty

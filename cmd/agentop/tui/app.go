@@ -49,13 +49,16 @@ const (
 	// which lists Kubernetes workloads and whose own purpose line used to call them "agents"
 	// too — see paneKeys for how the two are told apart.
 	paneAgents
+	// paneAudit lists the policy engine's signed audit records and agentop's own verdict on
+	// each. See audit_pane.go.
+	paneAudit
 )
 
 // lastPaneID is the highest valid paneID. Kept adjacent to the iota block so
 // adding a pane means updating one line here, and TestPaneKeysCoverAllPanes then
 // fails until that pane is documented in paneKeys — which is how paneUsage
 // shipped reachable by `u` but named in no footer and no help overlay.
-const lastPaneID = paneAgents
+const lastPaneID = paneAudit
 
 // paneNone is the explicit "no previous pane recorded" sentinel for
 // model.previousPane. Using paneNamespaces (the zero value) as a
@@ -385,6 +388,11 @@ type model struct {
 	// TUI's own behaviour rather than the age of anything it was sent.
 	now func() time.Time
 
+	// auditFile is set in the audit-file viewer (`agentop audit`), and only there: the audit
+	// pane is then the whole viewer, fed by the records file rather than a session API. See
+	// audit_file.go.
+	auditFile *auditFileSource
+
 	endpoint string
 	client   *apiclient.Client
 	// localEndpoint is what `[l]` connects to and what the footer and help
@@ -689,6 +697,8 @@ type model struct {
 	eventsTbl     table.Model
 	pipelineTbl   table.Model
 	catalogTbl    table.Model
+	auditTbl      table.Model
+	audit         auditState
 	detailVp      viewport.Model
 	// detailDoc is detailVp's text, searched — see searchdoc.go. Shared by message detail
 	// and plugin detail, as the viewport is.
@@ -940,6 +950,7 @@ func New(ctx context.Context, c *apiclient.Client, opts ...Option) tea.Model {
 		eventsTbl:    newEventsTable(),
 		pipelineTbl:  newPipelineTable(),
 		catalogTbl:   newCatalogTable(),
+		auditTbl:     newAuditTable(),
 		agentsTbl:    newAgentsTable(),
 		previousPane: paneNone,
 		// paneNone, not the zero value: paneNamespaces is 0, and a return pane
@@ -1046,6 +1057,10 @@ func (m *model) backToPodsPane() {
 	// versions registered. The next `P` press refetches.
 	m.catalog = nil
 	m.catalogTbl.SetRows(nil)
+	// Another proxy's audit records, and its own signing keys may differ; `V` refetches. The
+	// ledger is agentop's own setting, not the proxy's, so it is kept.
+	m.audit = auditState{ledgerAddr: m.audit.ledgerAddr, ledger: m.audit.ledger}
+	m.auditTbl.SetRows(nil)
 	// pickerHarvested and pickerShowing are deliberately NOT reset here. They are edge-derived: the
 	// next refresh tick recomputes "is the picker showing", finds it disagrees with the recorded
 	// pickerShowing, and clears the budget on that inequality. Resetting them here would make this
@@ -1136,6 +1151,9 @@ func (m *model) backToPodsPane() {
 func (m *model) syncHelpViewport(resetScroll bool) {
 	frameW := styleBorder.GetHorizontalBorderSize() + helpPadX*2
 	body := helpBodyLines(m.pane, m.width-frameW)
+	if m.auditFile != nil {
+		body = helpBodyAuditFile(m.width - frameW)
+	}
 	w, h := helpViewportSize(m.width, m.height, helpBodyWidth(body))
 	m.helpVp.Width = w
 	m.helpVp.Height = h
@@ -1167,6 +1185,9 @@ func (m *model) Init() tea.Cmd {
 	// Stamped here, not on arrival: the sessions pane's backoff is measured from when a harvest
 	// STARTS, so leaving it zero would make its first tick look overdue by the whole age of the
 	// clock regardless of when this harvest actually ran.
+	if m.auditFile != nil {
+		return m.initAuditFile()
+	}
 	if m.harvest != nil {
 		m.harvesting = true
 		m.lastHarvest = time.Now()
@@ -1544,6 +1565,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(m.fetchUsage(), usageTick(m.usage.tickGen))
 
 	case refreshTickMsg:
+		// The audit-file viewer has no sessions to refresh and no picker to harvest for; its tick
+		// exists only for the ledger, and initAuditFile starts it only when there is one.
+		if m.auditFile != nil {
+			return m, tea.Batch(m.loadLedgerCmd(), refreshTickCmd())
+		}
 		// ARRIVING AT THE PICKER ENDS ITS ONE-HARVEST-PER-VISIT BUDGET. Detected here, on the
 		// edge, so the two dozen places that assign m.pane do not each have to remember to clear
 		// it — and so one added later cannot quietly skip the harvest by inheriting a set flag.
@@ -1585,6 +1611,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Batch(harvestCmd(m.harvest), refreshTickCmd())
 			}
 			return m, refreshTickCmd()
+		}
+		// The audit pane's receipts arrive as the ledger's adapter ships records, so the pane
+		// re-reads the ledger on every tick while it is showing. The session refresh below waits:
+		// this pane shows none of it, and the next tick after leaving picks it up.
+		if m.pane == paneAudit && m.audit.ledgerAddr != "" {
+			return m, tea.Batch(m.loadLedgerCmd(), refreshTickCmd())
 		}
 		// RE-HARVEST FOR THE SESSIONS LIST, which is a picker as much as the two panes below
 		// are: it gains a row whenever a session appears and cannot name it without re-reading
@@ -1680,6 +1712,28 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.showPluginDetail(p, false)
 			}
 		}
+		return m, nil
+
+	case auditLoadedMsg:
+		// A failed refresh keeps the rows on screen and says so; a failed first load is the
+		// pane's body.
+		if msg.err != nil && m.audit.loaded {
+			m.setFlash("audit fetch failed: " + msg.err.Error())
+			return m, nil
+		}
+		m.applyAuditPage(msg)
+		return m, nil
+
+	case auditFileGrewMsg:
+		m.catchUpAuditFile()
+		return m, waitAuditFileCmd(m.auditFile.sub)
+
+	case ledgerLoadedMsg:
+		m.applyLedgerSnapshot(msg)
+		return m, nil
+
+	case ledgerProofMsg:
+		m.applyLedgerProof(msg)
 		return m, nil
 
 	case catalogLoadedMsg:
@@ -1787,6 +1841,13 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.handleStreamEvent(ev)
 		// Re-pump the same channel for the next message. A single apiclient
 		// goroutine fills the channel for the duration of ctx.
+		//
+		// A reconnect may be a restarted cortex, whose audit store re-read the records file and
+		// numbered it afresh: what agentop holds is then stale, an edit made while it was down
+		// included, and new records would be dropped as already seen. Refetch the whole set.
+		if ev.Status.Phase == "open" && m.audit.loaded {
+			return m, tea.Batch(streamPump(m.streamCh), m.refreshAuditCmd())
+		}
 		return m, streamPump(m.streamCh)
 
 	case spendLoadedMsg:
@@ -2192,6 +2253,10 @@ func (m *model) handleStreamEvent(ev apiclient.StreamEvent) {
 		}
 		return
 	}
+	if ev.Audit != nil {
+		m.appendAuditRecord(*ev.Audit)
+		return
+	}
 	if ev.Event == nil {
 		return
 	}
@@ -2477,6 +2542,8 @@ func (m *model) paneView() string {
 		default:
 			body = m.agentsTbl.View()
 		}
+	case paneAudit:
+		title, body = m.auditBody()
 	case paneCatalog:
 		title = fmt.Sprintf("%s · %s · catalog", m.appName(), m.endpoint)
 		if m.catalog == nil {
@@ -2861,6 +2928,9 @@ type RunOptions struct {
 	Harvest HarvestFunc
 	// Version names this build on the title bar. Empty shows the name alone.
 	Version string
+	// Ledger is the ARE ledger's gRPC address (host:port) the audit pane checks receipts
+	// against. Empty leaves the pane's RECEIPT column at "—".
+	Ledger string
 }
 
 // Run starts the bubbletea program. See RunOptions for mode selection.
@@ -2883,11 +2953,17 @@ func Run(ctx context.Context, opts RunOptions) error {
 	m.save = opts.Save
 	m.harvest = opts.Harvest
 	m.version = opts.Version
+	m.audit.ledgerAddr = opts.Ledger
 	defer func() {
 		if m.activePF != nil {
 			_ = m.activePF.Close()
 		}
 	}()
+	return runProgram(ctx, m)
+}
+
+// runProgram runs m full-screen until it quits or ctx is done.
+func runProgram(ctx context.Context, m *model) error {
 	// Application cursor-key mode (DECCKM) is what makes Terminal.app turn a trackpad
 	// or wheel scroll over the alt screen into Up/Down keypresses, as it does for vi and
 	// less. Without it the gesture scrolls the terminal's own scrollback, carrying the

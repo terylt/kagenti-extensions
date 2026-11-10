@@ -25,6 +25,10 @@
 // off is shown by highlighting the "…" that replaced it. Every piece of a row carries the
 // row's style itself, rather than the row being wrapped in it once: a highlight ends in a
 // reset, and a reset inside a wrapped row ends the row's style with it.
+//
+// Also added: SetRowStyle, a per-row base style for panes whose rows carry a state (the audit
+// pane draws a tampered record in red). Cells stay plain text; the style is applied the same way
+// the cursor's is.
 package table
 
 import (
@@ -52,6 +56,8 @@ type Model struct {
 	cursor int
 	focus  bool
 	styles Styles
+	// rowStyle, when set, gives a row a base style; see SetRowStyle.
+	rowStyle func(row int) (lipgloss.Style, bool)
 
 	// query is the search the rows are matched against, full the pane's full cell values
 	// for it (nil when the rows hold them already), and hits the rows that matched, by
@@ -179,6 +185,13 @@ func DefaultStyles() Styles {
 // SetStyles sets the table styles.
 func (m *Model) SetStyles(s Styles) {
 	m.styles = s
+	m.UpdateViewport()
+}
+
+// SetRowStyle sets a function that gives row r a base style when it returns true. The cursor's
+// style is drawn over it, inheriting what the cursor's style leaves unset. nil removes it.
+func (m *Model) SetRowStyle(fn func(row int) (lipgloss.Style, bool)) {
+	m.rowStyle = fn
 	m.UpdateViewport()
 }
 
@@ -576,11 +589,19 @@ func (m *Model) renderRow(r int) string {
 	}
 
 	row, match := lipgloss.NewStyle(), m.styles.Match
+	base, styled := lipgloss.NewStyle(), false
+	if m.rowStyle != nil {
+		base, styled = m.rowStyle(r)
+	}
 	switch {
 	case r == m.cursor:
-		row, match = m.styles.Selected, m.styles.CurrentMatch
+		// The cursor's style wins where it sets something, and the row's state shows
+		// through where it does not: a selected red row stays red.
+		row, match = m.styles.Selected.Inherit(base), m.styles.CurrentMatch
 	case spans != nil && !lit:
 		row = m.styles.Marked
+	case styled:
+		row = base
 	}
 	match = match.Inherit(row)
 

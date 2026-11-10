@@ -40,6 +40,17 @@ func (m *model) footerView() string {
 			styleHint.Render(fitHintLine(m.helpView(), m.width))
 	}
 
+	// The audit-file viewer has no connection and no event stream: the dot names the file
+	// instead, and there is no rate.
+	if m.auditFile != nil {
+		status.WriteString(m.auditFileStatus())
+		if m.flash != "" && time.Now().Before(m.flashUntil) {
+			status.WriteString(styleTitle.Render("   " + m.flash))
+		}
+		return fitStatusLine(status.String(), m.width) + "\n" +
+			styleHint.Render(fitHintLine(m.helpView(), m.width))
+	}
+
 	// Connection state dot.
 	switch m.connState.phase {
 	case connOpen:
